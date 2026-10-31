@@ -2,7 +2,10 @@ const API = '/api';
 
 export async function request(path, options = {}) {
   const res = await fetch(`${API}${path}`, { headers: { 'Content-Type': 'application/json' }, ...options });
-  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw Object.assign(new Error(body.error || res.statusText), { code: body.code || null });
+  }
   return res.status === 204 ? null : res.json();
 }
 

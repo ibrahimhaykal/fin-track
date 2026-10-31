@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertCircle, RefreshCw } from 'lucide-react';
 import { del, post, put, request } from './lib/api';
+import { DEVELOPER_EMAIL, mailtoDeveloper } from './lib/contact';
 import { confirmDanger, notify, swal } from './lib/alerts';
 import { readHiddenPref, rupiah, saveHiddenPref, setAmountsHidden, todayWib } from './lib/format';
 import { safeToSpend, spentByCategory, summarize } from './lib/finance';
@@ -22,6 +23,8 @@ import {
   TransactionForm,
   WalletForm,
   WalletIconForm,
+  PaydayForm,
+  GmailSettingsForm,
 } from './components/Forms';
 import Header from './components/Header';
 import RecapModal, { RecapBanner, markRecapSeen, recapSeen } from './components/RecapModal';
@@ -34,7 +37,7 @@ import WalletGrid from './components/WalletGrid';
 export default function App() {
   const [data, setData] = useState(null);
   const [loadError, setLoadError] = useState('');
-  const [modal, setModal] = useState(null); // 'transaction' | 'wallet' | 'expense' | 'milestone' | 'syncLog'
+  const [modal, setModal] = useState(null); // 'transaction' | 'wallet' | 'expense' | 'milestone' | 'syncLog' | 'gmail'
   const [iconFor, setIconFor] = useState(null); // wallet whose icon is being changed
   const [cryptoFor, setCryptoFor] = useState(null); // wallet being set up as a live crypto wallet
   const [linkFor, setLinkFor] = useState(null); // unlinked transfer being matched to wallets
@@ -207,6 +210,15 @@ export default function App() {
     onPlanStart: (date) => run(() => put('/settings/plan-start', { date }), 'Tanggal mulainya udah disimpan'),
   };
 
+  // "Tanggal gajian" for this or next period. Throws so the modal shows the error inline.
+  const [paydayOpen, setPaydayOpen] = useState(false);
+  const savePayday = async (period, date) => {
+    await put('/settings/payday', { period, date });
+    setPaydayOpen(false);
+    await load();
+    notify(true, 'Tanggal gajiannya udah disimpan');
+  };
+
   // Category picker for one ledger row (suggestions: categorySuggestions below). Throws so the modal shows the error.
   const [categoryFor, setCategoryFor] = useState(null);
   const saveCategory = async (t, category) => {
@@ -256,7 +268,9 @@ export default function App() {
     setModal('syncLog');
   };
 
+  // Gmail not connected yet: the sync button opens the settings instead.
   const syncGmail = async () => {
+    if (data?.sync && data.sync.configured === false) return setModal('gmail');
     setSyncing(true);
     try {
       const result = await post('/sync-gmail', {});
@@ -270,10 +284,16 @@ export default function App() {
       openSyncLog(result);
       load();
     } catch (e) {
-      swal.fire({ icon: 'error', title: 'Duh, gagal ngecek email', text: e.message, confirmButtonText: 'Oke' });
+      if (e.code === 'gmail_not_configured') setModal('gmail');
+      else swal.fire({ icon: 'error', title: 'Duh, gagal ngecek email', text: e.message, confirmButtonText: 'Oke' });
     } finally {
       setSyncing(false);
     }
+  };
+  const saveGmailSettings = async (s) => {
+    setModal(null);
+    await load();
+    notify(true, s.configured ? 'Pengaturan Gmail udah disimpan' : 'Gmail udah diputusin');
   };
 
   const revertSync = async (row) => {
@@ -335,6 +355,7 @@ export default function App() {
           hidden={hidden}
           onToggleHidden={toggleHidden}
           onOpenLog={() => openSyncLog()}
+          onSettings={() => setModal('gmail')}
           onSync={syncGmail}
           syncing={syncing}
         />
@@ -359,7 +380,9 @@ export default function App() {
         <Summary
           stats={stats}
           safe={safe}
+          streak={data.streak}
           onRecap={() => openRecap(data.actual.month)}
+          onPayday={data.actual.periods ? () => setPaydayOpen(true) : null}
           actual={data.actual}
           planStart={data.planStart}
           walletCount={wallets.length}
@@ -397,7 +420,12 @@ export default function App() {
               planActive={data.actual.month >= data.planStart.slice(0, 7)}
               planActions={planActions}
             />
-            <RecurringCard recurring={data.recurring || []} walletNames={walletNames} {...recurringActions} />
+            <RecurringCard
+              recurring={data.recurring || []}
+              walletNames={walletNames}
+              {...recurringActions}
+              onPayday={data.actual.periods ? () => setPaydayOpen(true) : null}
+            />
           </div>
         </div>
 
@@ -419,6 +447,13 @@ export default function App() {
             onDelete={deleteExpense}
           />
         </div>
+
+        <footer className="mt-10 text-center text-xs text-zinc-600">
+          Ada saran, nemu bug, atau bank kamu belum kebaca?{' '}
+          <a href={mailtoDeveloper('Celengin: saran / bug')} target="_blank" rel="noreferrer" className="text-zinc-400 hover:text-sky-400 hover:underline">
+            Kabarin {DEVELOPER_EMAIL}
+          </a>
+        </footer>
       </div>
 
       {modal === 'transaction' && (
@@ -460,6 +495,7 @@ export default function App() {
       )}
       {cryptoFor && <LivePriceForm wallet={cryptoFor} onSave={saveCrypto} onClose={() => setCryptoFor(null)} />}
       {recap && <RecapModal initialMonth={recap.month} onClose={() => setRecap(null)} />}
+      {paydayOpen && <PaydayForm periods={data.actual.periods} onSave={savePayday} onClose={() => setPaydayOpen(false)} />}
       {recurringEdit && (
         <RecurringForm
           rule={recurringEdit.rule}
@@ -485,6 +521,7 @@ export default function App() {
       {linkFor && (
         <LinkTransferForm tx={linkFor} wallets={wallets} onLink={linkTransaction} onClose={() => setLinkFor(null)} />
       )}
+      {modal === 'gmail' && <GmailSettingsForm wallets={wallets} onSaved={saveGmailSettings} onClose={closeModal} />}
       {modal === 'syncLog' && (
         <SyncLogModal
           result={syncResult}

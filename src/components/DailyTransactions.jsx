@@ -40,10 +40,10 @@ const dayLabel = (date, today) => {
   });
 };
 
-// The 12 months up to `today` as { value: '2026-10', label: 'Oktober 2026' }, newest first.
-const recentMonths = (today) => {
-  if (!today) return [];
-  const [y, m] = today.split('-').map(Number);
+// The 12 pay periods up to the current one as { value: '2026-10', label: 'Oktober 2026' }, newest first.
+const recentMonths = (period) => {
+  if (!period) return [];
+  const [y, m] = period.split('-').map(Number);
   return Array.from({ length: 12 }, (_, i) => {
     const d = new Date(Date.UTC(y, m - 1 - i, 1));
     return {
@@ -176,7 +176,7 @@ export default function DailyTransactions({ walletNames, refreshKey, onAdd, onDe
               onChange={(month) => set({ month })}
               title="Filter bulan"
               className="py-2"
-              options={[{ value: '', label: 'Semua bulan' }, ...recentMonths(day.today)]}
+              options={[{ value: '', label: 'Semua bulan' }, ...recentMonths(day.period || day.today)]}
             />
           </div>
         </div>

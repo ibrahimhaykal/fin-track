@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { CheckCircle2, Inbox, RotateCcw } from 'lucide-react';
 import { request } from '../lib/api';
+import { DEVELOPER_EMAIL, mailtoDeveloper } from '../lib/contact';
 import { notify } from '../lib/alerts';
 import { formatDate } from '../lib/format';
 import { TxAmount, TxTypeLabel } from './tx';
@@ -58,6 +59,18 @@ export default function SyncLogModal({ result, start, refreshKey, onRevert, onCl
               {reason} · {n}
             </span>
           ))}
+          <p className="basis-full text-zinc-500">
+            Email transaksi dari bank kamu nggak kebaca? Forward satu contohnya ke{' '}
+            <a
+              href={mailtoDeveloper('Celengin: format email belum kebaca')}
+              target="_blank"
+              rel="noreferrer"
+              className="text-sky-400 hover:underline"
+            >
+              {DEVELOPER_EMAIL}
+            </a>{' '}
+            (sensor dulu nomor rekening & saldonya), nanti formatnya ditambahin.
+          </p>
         </div>
       )}
       <SyncLogTable rows={rows} newIds={newIds} onRevert={onRevert} start={start} />

@@ -1,4 +1,4 @@
-import { ArrowDownLeft, ArrowUpRight, BellRing, CalendarClock, CheckCircle2, Plus, Repeat, SkipForward, Trash2, Undo2 } from 'lucide-react';
+import { ArrowDownLeft, ArrowUpRight, BellRing, CalendarClock, CalendarDays, CheckCircle2, Plus, Repeat, SkipForward, Trash2, Undo2 } from 'lucide-react';
 import { daysUntil, rupiah } from '../lib/format';
 import { Card, CardHeader, EditableAmount, EmptyState, GhostButton, IconButton } from './ui';
 
@@ -112,7 +112,7 @@ function Status({ rule, occ, walletName, onConfirm, onUnskip }) {
 }
 
 // Monthly schedules with this month's status. Amount edits in place; clicking the name opens the full edit form.
-export default function RecurringCard({ recurring, walletNames, onAdd, onEdit, onUpdate, onDelete, onConfirm, onUnskip }) {
+export default function RecurringCard({ recurring, walletNames, onAdd, onEdit, onUpdate, onDelete, onConfirm, onUnskip, onPayday }) {
   const settled = recurring.filter((r) => r.occurrences.at(-1)?.status === 'done').length;
   return (
     <Card>
@@ -120,9 +120,16 @@ export default function RecurringCard({ recurring, walletNames, onAdd, onEdit, o
         title="Rutin Bulanan"
         subtitle={recurring.length ? `${settled} dari ${recurring.length} udah beres bulan ini` : 'Gaji, kiriman, tagihan tiap bulan'}
         action={
-          <GhostButton onClick={onAdd}>
-            <Plus size={14} /> Jadwal
-          </GhostButton>
+          <div className="flex items-center gap-1">
+            {onPayday && (
+              <GhostButton onClick={onPayday}>
+                <CalendarDays size={14} /> Tgl gajian
+              </GhostButton>
+            )}
+            <GhostButton onClick={onAdd}>
+              <Plus size={14} /> Jadwal
+            </GhostButton>
+          </div>
         }
       />
       <ul className="px-3 pb-4">
@@ -148,7 +155,7 @@ export default function RecurringCard({ recurring, walletNames, onAdd, onEdit, o
                   {r.name}
                 </button>
                 <p className="truncate text-xs text-zinc-500">
-                  tiap tgl {r.day} · {walletName}
+                  {r.day === 1 ? 'tiap gajian' : `tiap tgl ${r.day}`} · {walletName}
                   {r.category && r.category !== r.name && <> · {r.category}</>}
                 </p>
               </div>

@@ -73,20 +73,23 @@ export function safeToSpend({ wallets, expenses, actual, recurring = [] }, today
     .filter((x) => !scheduledCats.has(lower(x.name)))
     .reduce((s, x) => s + Math.max(0, x.amount - (spent[lower(x.name)] || 0)), 0);
 
-  // Next salary: the nearest upcoming income schedule (this month's if still ahead, else next month's).
-  const [y, m] = today.split('-').map(Number);
+  // Next salary: the nearest upcoming income schedule (this period's if still ahead, else next period's).
+  // A schedule on day 1 is "on payday", so next period's one falls on its (possibly moved) start.
+  const nextStart = actual.periods?.[1]?.start;
+  const [y, m] = month.split('-').map(Number);
   const nextIncome = recurring
     .filter((r) => r.type === 'income')
     .map((r) => {
       const thisMonth = r.occurrences.find((o) => o.period === month);
       if (thisMonth && thisMonth.status === 'upcoming') return { name: r.name, date: thisMonth.due };
+      if (r.day === 1 && nextStart) return { name: r.name, date: nextStart };
       const next = new Date(Date.UTC(y, m, 1));
       const last = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
       return { name: r.name, date: `${next.toISOString().slice(0, 8)}${String(Math.min(r.day, last)).padStart(2, '0')}` };
     })
     .sort((a, b) => a.date.localeCompare(b.date))[0];
-  // No salary schedule: budgets are monthly, so count until the 1st of next month.
-  const until = nextIncome?.date || new Date(Date.UTC(y, m, 1)).toISOString().slice(0, 10);
+  // No salary schedule: budgets run per pay period, so count until the next one starts.
+  const until = nextIncome?.date || nextStart || new Date(Date.UTC(y, m, 1)).toISOString().slice(0, 10);
   const daysLeft = Math.max(1, Math.round((new Date(`${until}T00:00:00Z`) - new Date(`${today}T00:00:00Z`)) / 86400000));
 
   const safe = liquid - scheduledTotal - budgetLeft;

@@ -905,6 +905,250 @@ export function RecurringForm({ rule, wallets, categories, defaultWallet, onSave
   );
 }
 
+// "Pengaturan Gmail": the mailbox to read transaction emails from, from when, and the default wallet.
+// The App Password is write-only: the server only says whether one is saved.
+export function GmailSettingsForm({ wallets, onSaved, onClose }) {
+  const [s, setS] = useState(null);
+  const [v, setV] = useState({ user: '', pass: '', start: '', mainWallet: '' });
+  const [busy, setBusy] = useState('');
+  const [error, setError] = useState('');
+  const [tested, setTested] = useState(false);
+
+  useEffect(() => {
+    request('/settings/gmail')
+      .then((r) => {
+        setS(r);
+        setV({ user: r.user, pass: '', start: r.start, mainWallet: r.mainWallet || '' });
+      })
+      .catch((e) => setError(e.message));
+  }, []);
+  const set = (k, val) => {
+    setV((x) => ({ ...x, [k]: val }));
+    setTested(false);
+  };
+  const body = () => ({ user: v.user, pass: v.pass, start: v.start, mainWallet: v.mainWallet || null });
+
+  const act = (kind, fn) => async (e) => {
+    e?.preventDefault();
+    setError('');
+    setBusy(kind);
+    try {
+      await fn();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy('');
+    }
+  };
+  const test = act('test', async () => {
+    await request('/settings/gmail/test', { method: 'POST', body: JSON.stringify(body()) });
+    setTested(true);
+  });
+  const save = act('save', async () => onSaved(await request('/settings/gmail', { method: 'PUT', body: JSON.stringify(body()) })));
+  const disconnect = act('disconnect', async () =>
+    onSaved(await request('/settings/gmail', { method: 'PUT', body: JSON.stringify({ disconnect: true }) }))
+  );
+
+  const guessed = wallets.find((w) => w.id === s?.guessedMainWallet)?.name;
+  return (
+    <Modal title="Pengaturan Gmail" onClose={onClose}>
+      {!s ? (
+        <p className="text-sm text-zinc-500">{error || 'Bentar…'}</p>
+      ) : (
+        <form onSubmit={save} className="space-y-4">
+          <p className="text-xs leading-relaxed text-zinc-400">
+            Celengin cuma baca email notif transaksi dari bank & aplikasi yang dikenal. Email diproses di laptop ini,
+            nggak dikirim ke mana-mana. Pakai{' '}
+            <a
+              href="https://myaccount.google.com/apppasswords"
+              target="_blank"
+              rel="noreferrer"
+              className="text-sky-400 hover:underline"
+            >
+              App Password Gmail
+            </a>{' '}
+            (16 huruf), bukan password biasa. Perlu verifikasi 2 langkah aktif.
+          </p>
+          {s.fromEnv && (
+            <p className="rounded-lg bg-white/[0.03] px-3 py-2 text-xs text-zinc-400">
+              Sekarang kebaca dari file <code>.env</code>. Kalau disimpan di sini, setting ini yang dipakai.
+            </p>
+          )}
+          <label className="block">
+            <span className="mb-1.5 block text-xs font-medium text-zinc-400">Email Gmail</span>
+            <input
+              type="email"
+              autoFocus
+              value={v.user}
+              onChange={(e) => set('user', e.target.value)}
+              placeholder="kamu@gmail.com"
+              className={inputCls}
+            />
+          </label>
+          <label className="block">
+            <span className="mb-1.5 block text-xs font-medium text-zinc-400">App Password</span>
+            <input
+              type="password"
+              autoComplete="new-password"
+              value={v.pass}
+              onChange={(e) => set('pass', e.target.value)}
+              placeholder={s.hasPassword ? '•••• udah tersimpan (kosongin kalau nggak diganti)' : 'abcd efgh ijkl mnop'}
+              className={inputCls}
+            />
+          </label>
+          <div className="grid grid-cols-2 gap-3">
+            <label className="block">
+              <span className="mb-1.5 block text-xs font-medium text-zinc-400">Baca email mulai</span>
+              <input type="date" value={v.start} max={todayWib()} onChange={(e) => set('start', e.target.value)} className={inputCls} />
+            </label>
+            <div>
+              <span className="mb-1.5 block text-xs font-medium text-zinc-400">Wallet utama</span>
+              <Select
+                value={v.mainWallet}
+                onChange={(id) => set('mainWallet', id)}
+                options={[
+                  { value: '', label: guessed ? `Otomatis (${guessed})` : 'Otomatis' },
+                  ...wallets.filter((w) => !w.asset).map((w) => ({ value: w.id, label: w.name })),
+                ]}
+              />
+            </div>
+          </div>
+          <p className="-mt-2 text-xs text-zinc-500">
+            Wallet utama dipakai buat transaksi yang email-nya nggak nyebut pocket/rekening.
+          </p>
+          {error && (
+            <p className="flex items-center gap-2 text-sm text-rose-400">
+              <AlertCircle size={15} /> {error}
+            </p>
+          )}
+          {tested && <p className="text-sm text-emerald-400">Nyambung! Login Gmail berhasil.</p>}
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={test}
+              disabled={Boolean(busy)}
+              className="flex-1 rounded-lg border border-white/[0.08] px-4 py-2.5 text-sm font-medium text-zinc-200 transition-colors hover:bg-white/[0.04] disabled:opacity-60"
+            >
+              {busy === 'test' ? 'Ngecek…' : 'Tes koneksi'}
+            </button>
+            <button
+              disabled={Boolean(busy)}
+              className="flex-1 rounded-lg bg-zinc-100 px-4 py-2.5 text-sm font-semibold text-zinc-900 transition-colors hover:bg-white disabled:opacity-60"
+            >
+              {busy === 'save' ? 'Nyimpen…' : 'Simpan'}
+            </button>
+          </div>
+          {s.configured && !s.fromEnv && (
+            <button
+              type="button"
+              onClick={disconnect}
+              disabled={Boolean(busy)}
+              className="w-full text-center text-xs text-zinc-500 transition-colors hover:text-rose-400"
+            >
+              Putusin Gmail dari Celengin
+            </button>
+          )}
+        </form>
+      )}
+    </Modal>
+  );
+}
+
+const periodLabel = (ym) =>
+  new Date(`${ym}-01T00:00:00Z`).toLocaleDateString('id-ID', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+const dayLabel = (date) =>
+  new Date(`${date}T00:00:00Z`).toLocaleDateString('id-ID', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' });
+
+// "Tanggal gajian": when a period's salary actually came, which is where that period starts (default the 1st).
+// `periods` = [this period, next period] from the dashboard; the upcoming payday is picked once it is near.
+export function PaydayForm({ periods, onSave, onClose }) {
+  const today = todayWib();
+  const [current, next] = periods;
+  const [period, setPeriod] = useState(today >= next.bounds[0] ? next.period : current.period);
+  const info = periods.find((p) => p.period === period);
+  const [date, setDate] = useState(info.start);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const first = `${period}-01`;
+  const lastOfPrev = new Date(Date.UTC(Number(period.slice(0, 4)), Number(period.slice(5, 7)) - 1, 0)).toISOString().slice(0, 10);
+
+  const pickPeriod = (p) => {
+    setPeriod(p);
+    setDate(periods.find((x) => x.period === p).start);
+  };
+  const submit = async (e) => {
+    e.preventDefault();
+    setError('');
+    setSaving(true);
+    try {
+      await onSave(period, date === first ? null : date);
+    } catch (err) {
+      setError(err.message);
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal title="Tanggal gajian" onClose={onClose}>
+      <form onSubmit={submit} className="space-y-4">
+        <p className="text-xs leading-relaxed text-zinc-400">
+          Periode keuangan mulai dari hari gajian sampai sehari sebelum gajian berikutnya. Kalau gajinya maju (misal
+          masuk 31 Okt), semua yang masuk & keluar dari tanggal itu diitung ke bulan berikutnya.
+        </p>
+        <label className="block">
+          <span className="mb-1.5 block text-xs font-medium text-zinc-400">Gaji buat bulan</span>
+          <Select
+            value={period}
+            onChange={pickPeriod}
+            options={periods.map((p) => ({ value: p.period, label: periodLabel(p.period) }))}
+          />
+        </label>
+        <div>
+          <span className="mb-1.5 block text-xs font-medium text-zinc-400">Masuknya tanggal</span>
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {[
+              [first, 'Tgl 1 (biasa)'],
+              [lastOfPrev, `Akhir bulan, ${dayLabel(lastOfPrev)}`],
+            ].map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() => setDate(value)}
+                className={`rounded-lg px-2.5 py-1.5 text-xs font-medium ring-1 ring-inset transition-colors ${date === value ? 'bg-sky-500/15 text-sky-300 ring-sky-500/40' : 'text-zinc-400 ring-white/[0.08] hover:text-zinc-200'}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <input
+            type="date"
+            required
+            value={date}
+            min={info.bounds[0]}
+            max={info.bounds[1]}
+            onChange={(e) => setDate(e.target.value)}
+            className={inputCls}
+          />
+          <p className="mt-1.5 text-xs text-zinc-500">
+            {periodLabel(period)} jadi mulai <span className="text-zinc-300">{dayLabel(date || first)}</span>
+          </p>
+        </div>
+        {error && (
+          <p className="flex items-center gap-2 text-sm text-rose-400">
+            <AlertCircle size={15} /> {error}
+          </p>
+        )}
+        <button
+          disabled={saving}
+          className="w-full rounded-lg bg-zinc-100 px-4 py-2.5 text-sm font-semibold text-zinc-900 transition-colors hover:bg-white disabled:opacity-60"
+        >
+          {saving ? 'Nyimpen…' : 'Simpan'}
+        </button>
+      </form>
+    </Modal>
+  );
+}
+
 // "Udah masuk" / "Udah dibayar" for one month of a schedule: the amount can differ (bonus, deductions).
 export function RecurringConfirmForm({ rule, occ, walletName, onConfirm, onClose }) {
   const [amount, setAmount] = useState(String(Math.round(rule.amount)));

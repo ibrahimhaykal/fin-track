@@ -114,6 +114,11 @@ const syncLogColumns = db.prepare('PRAGMA table_info(gmail_sync_log)').all().map
 for (const col of ['source', 'email_date', 'wallet']) {
   if (!syncLogColumns.includes(col)) db.exec(`ALTER TABLE gmail_sync_log ADD COLUMN ${col} TEXT`);
 }
+// A reverted entry stays in the log so the same email is never re-applied on the next sync.
+// Added before the "forwarded" migration below, which reads it (a fresh database has neither column).
+if (!syncLogColumns.includes('reverted')) {
+  db.exec('ALTER TABLE gmail_sync_log ADD COLUMN reverted INTEGER NOT NULL DEFAULT 0');
+}
 // Whether the synced email was a forwarded copy (manual "Fwd:" or from another mailbox). Only an original and a
 // forwarded copy of the same notification are treated as duplicates; two originals are two real transactions.
 if (!syncLogColumns.includes('forwarded')) {
@@ -128,10 +133,8 @@ if (!syncLogColumns.includes('forwarded')) {
                WHERE o.forwarded = 1 AND o.type = gmail_sync_log.type AND o.amount = gmail_sync_log.amount
                  AND o.subject = gmail_sync_log.subject)`);
 }
-// A reverted entry stays in the log so the same email is never re-applied on the next sync.
-if (!syncLogColumns.includes('reverted')) {
-  db.exec('ALTER TABLE gmail_sync_log ADD COLUMN reverted INTEGER NOT NULL DEFAULT 0');
-}
+// Units a "unit reksa dana sudah masuk" email added to a fund wallet (no ledger row), so it can be reverted.
+if (!syncLogColumns.includes('units')) db.exec('ALTER TABLE gmail_sync_log ADD COLUMN units REAL');
 
 // ---------- Monthly plan (editable) ----------
 // The salary plan: income and fixed-expense lines the user manages in the UI, plus the date it starts.
@@ -175,10 +178,24 @@ const getSetting = (key, fallback) => db.prepare('SELECT value FROM settings WHE
 const setSetting = (key, value) =>
   db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value);
 
-// Plan start: saved setting > PLAN_START_DATE in .env > 1 Oct 2026.
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
-const planStart = () =>
-  getSetting('plan_start', DATE_ONLY_RE.test(process.env.PLAN_START_DATE || '') ? process.env.PLAN_START_DATE : '2026-10-01');
+const envDate = (name) => (DATE_ONLY_RE.test(process.env[name] || '') ? process.env[name] : null);
+// The 1st of the current month in WIB, the starting point for a fresh install.
+const firstOfThisMonth = () =>
+  `${new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date()).slice(0, 7)}-01`;
+
+// Databases from before these dates were saved ran on a fixed 1 Oct 2026; they keep it. A fresh one starts this month.
+{
+  const used = (table) => db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get();
+  const legacy = '2026-10-01';
+  if (!getSetting('plan_start', null) && !envDate('PLAN_START_DATE')) {
+    setSetting('plan_start', used('transactions') ? legacy : firstOfThisMonth());
+  }
+  if (!getSetting('sync_start', null) && !envDate('SYNC_START_DATE') && used('gmail_sync_log')) setSetting('sync_start', legacy);
+}
+
+// Plan start: saved setting > PLAN_START_DATE in .env > this month.
+const planStart = () => getSetting('plan_start', envDate('PLAN_START_DATE') || firstOfThisMonth());
 const listPlanItems = () => db.prepare('SELECT * FROM plan_items ORDER BY type DESC, COALESCE(sort_order, id), id').all();
 
 // ---------- Gmail Financial Sync ----------
@@ -197,15 +214,23 @@ const TX_RULES = [
   { type: 'transfer', re: /pocket main|kantong utama/i },
 ];
 
-// Emails before this date are never synced (fresh start on payday). Override with SYNC_START_DATE=YYYY-MM-DD.
-const SYNC_START = /^\d{4}-\d{2}-\d{2}$/.test(process.env.SYNC_START_DATE || '') ? process.env.SYNC_START_DATE : '2026-10-01';
-const SYNC_START_TIME = new Date(`${SYNC_START}T00:00:00+07:00`).getTime(); // WIB midnight
-// Gmail's after: is day-granular in Pacific time, so search from the day before and filter exactly in code.
-const gmailAfter = new Date(SYNC_START_TIME - 86400000).toISOString().slice(0, 10).replace(/-/g, '/');
+// Gmail connection, set in the app (Pengaturan Gmail) or, as before, in .env. The app's own setting wins.
+// sync_start: emails before this date are never synced (fresh start on payday).
+function gmailConfig() {
+  return {
+    user: getSetting('gmail_user', null) || process.env.GMAIL_USER || '',
+    pass: (getSetting('gmail_app_pass', null) || process.env.GMAIL_APP_PASS || '').replace(/\s+/g, ''),
+    start: getSetting('sync_start', null) || envDate('SYNC_START_DATE') || firstOfThisMonth(),
+  };
+}
+const gmailConfigured = ({ user, pass }) => Boolean(user && pass && !user.startsWith('email_lu'));
+const syncStartTime = (start) => new Date(`${start}T00:00:00+07:00`).getTime(); // WIB midnight
 
 // PRIVACY LOCK: the IMAP search only returns emails containing a whitelisted phrase or sender.
-const GMAIL_QUERY =
-  `after:${gmailAfter} -category:promotions -category:social -category:forums {` +
+// Gmail's after: is day-granular in Pacific time, so search from the day before and filter exactly in code.
+const gmailQuery = (start) =>
+  `after:${new Date(syncStartTime(start) - 86400000).toISOString().slice(0, 10).replace(/-/g, '/')} ` +
+  '-category:promotions -category:social -category:forums {' +
   [
     '"Your Jago pocket has received"',
     '"Your pocket has received"',
@@ -222,12 +247,21 @@ const GMAIL_QUERY =
     'from:noreply@jago.com', // every Jago transaction notification (marketing comes from info@jago.com)
     'from:bca.co.id', // myBCA "Internet Transaction Journal" (non-transaction mail is skipped by the parser)
     'from:support@pintu.co.id', // Pintu Rupiah deposits / withdrawals (marketing comes from marketing.pintu.co.id)
+    'from:no-reply@bibit.id', // Bibit purchases / units / redemptions (marketing comes from info@bibit.id)
+    // Other banks & e-wallets (general parser; account notices and promos are skipped there)
+    ...[
+      'bankmandiri.co.id', 'bri.co.id', 'bni.co.id', 'bankbsi.co.id', 'cimbniaga.co.id', 'permatabank.co.id', 'permatabank.com',
+      'danamon.co.id', 'btn.co.id', 'seabank.co.id', 'ocbc.id', 'btpn.com', 'jenius.com', 'bcadigital.co.id', 'superbank.id',
+      'allobank.com', 'dana.id', 'ovo.id', 'shopeepay.co.id', 'linkaja.id',
+    ].map((d) => `from:${d}`),
     'from:itemku',
     'subject:itemku',
     'from:steampowered.com',
     'subject:steam',
   ].join(' ') +
   '}';
+// The wallet emails without a pocket name land in: chosen in the app > SYNC_MAIN_WALLET in .env > guessed.
+const mainWalletSetting = () => getSetting('main_wallet', null) || process.env.SYNC_MAIN_WALLET || null;
 const GMAIL_MAX_MESSAGES = 50;
 
 // ANTI-NEWSLETTER GUARDRAIL: any hit means the email is ignored.
@@ -285,15 +319,48 @@ function jagoRule(subject, body) {
   return null;
 }
 
+// The subject only says what kind of transaction it was; the payee is in the body's summary:
+// "To kentang 88 9360001234567890123 Amount", "To SITI AMINAH Jago • 501234567890 Amount", "To: 081234567890 Amount:".
+const JAGO_BANK_RE = /\s+(Jago|BCA|BNI|BRI|Mandiri|BSI|BTN|CIMB Niaga|CIMB|Permata|Danamon|OCBC|Maybank|Panin|SeaBank|blu|Jenius|Superbank)$/i;
+function jagoPayee(body) {
+  const raw = /\bTo:?\s+(.+?)\s+Amount\b/i.exec(body || '')?.[1]?.trim();
+  if (!raw) return null;
+  const number = /\d{6,}$/.exec(raw)?.[0] || null; // account / merchant / phone number
+  let name = raw.replace(/\s*•?\s*\d{6,}$/, '').trim();
+  // Only a bank transfer has "Bank • number"; a merchant named "... Blu" is not a bank.
+  const bank = raw.includes('•') ? JAGO_BANK_RE.exec(name)?.[1] || null : null;
+  if (bank) name = name.slice(0, -bank.length).trim();
+  return { name: name || null, bank, number };
+}
+
+// "Bayar kentang 88", "Transfer ke SITI AMINAH", "Transfer ke BCA" (own account), "Top up e-Wallet 0812…".
+function jagoDescription(subject, payee, holder) {
+  if (/debit card/i.test(subject)) return 'Bayar pakai kartu debit Jago';
+  if (/top.?up/i.test(subject) && payee) return `Top up e-Wallet ${payee.name || payee.number}`;
+  if (/made a transfer|transferred/i.test(subject) && payee?.name) {
+    return `Transfer ke ${payee.bank && sameName(payee.name, holder) ? payee.bank : payee.name}`;
+  }
+  if (/made a payment/i.test(subject)) {
+    const merchant = payee?.name || merchantOf(subject);
+    if (merchant) return `Bayar ${merchant}`;
+  }
+  return subject;
+}
+
 // ---------- BCA: myBCA "Internet Transaction Journal" ----------
 // Sent for money leaving a BCA account (transfers, virtual accounts / top-ups, payments). The body is a list of
 // "Label : value" pairs; amounts are English-formatted ("IDR 1,200,000.00").
 const BCA_SENDER_RE = /@bca\.co\.id/i;
 const BCA_BODY_RE = /\bmyBCA\b|\bKlikBCA\b|PT\.?\s*Bank Central Asia Tbk/i;
 const BCA_LABELS = [
-  'Status', 'Transaction Date', 'Transfer Type', 'Payment Type', 'Source of Fund', 'Source Currency',
-  'Beneficiary Account', 'Beneficiary Bank', 'Beneficiary Name', 'Transfer Currency', 'Transfer Amount',
+  'Status', 'Transaction Date', 'Transaction Type', 'Transfer Type', 'Payment Type', 'Source of Fund', 'Source Currency',
+  'Beneficiary Account', 'Beneficiary Account No.', 'Beneficiary Bank', 'Beneficiary Name', 'Save to beneficiary list',
+  'Transfer Currency', 'Transfer Amount', 'Transfer Method', 'Fee',
   'BCA Virtual Account No.', 'Company/Product Name', 'Merchant Name', 'Customer ID', 'Name', 'Transfer Bill Total', 'Bill Total',
+  // QRIS: "Payment to : ketoprak maskur"
+  'Payment to', 'Merchant Location', 'Acquirer', 'Merchant PAN', 'Terminal ID', 'Customer PAN', 'RRN',
+  // e-wallet top up: "Name : Bxxx Sxxxxxx Phone No. : 0812 - …"
+  'Phone No.', 'Admin Fee',
   'Total Payment', 'Amount', 'Remarks', 'Description', 'Reference No.',
 ];
 const BCA_LABEL_RE = new RegExp(
@@ -326,8 +393,25 @@ function parseMoney(value) {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-const sameName = (a, b) =>
-  Boolean(a && b) && a.replace(/\s+/g, ' ').trim().toUpperCase() === b.replace(/\s+/g, ' ').trim().toUpperCase();
+// Account holder from the greeting: "Hello BUDI SANTOSO," -> "BUDI SANTOSO".
+const holderOf = (body) => /\b(?:Hi|Hello|Halo|Dear|Yth\.?)\s+([A-Z][A-Z .'-]+?)\s*,/.exec(body || '')?.[1] || null;
+
+// Same person, also when one side is masked the way BCA masks e-wallet names ("Bxxx Sxxxxxx" = "BUDI SANTOSO").
+function sameName(a, b) {
+  if (!a || !b) return false;
+  const words = (s) => s.replace(/\s+/g, ' ').trim().toUpperCase().split(' ');
+  const [x, y] = [words(a), words(b)];
+  const masked = (m, w) => /^.X+$/.test(m) && m.length === w.length && m[0] === w[0];
+  return x.length === y.length && x.every((w, i) => w === y[i] || masked(w, y[i]) || masked(y[i], w));
+}
+
+// "e-Wallet - GO-PAY TOPUP" -> "GoPay"
+function eWalletOf(type) {
+  const m = /e-?wallet\s*-\s*(.+?)(?:\s+top\s?up)?$/i.exec(type || '');
+  if (!m) return null;
+  const name = m[1].trim();
+  return /^go-?pay$/i.test(name) ? 'GoPay' : /^shopee-?pay$/i.test(name) ? 'ShopeePay' : name;
+}
 
 // Parsed journal, a skip-reason string, or null when the email is not a BCA transaction journal.
 function parseBcaJournal(subject, body) {
@@ -337,8 +421,11 @@ function parseBcaJournal(subject, body) {
   const amount = parseMoney(f['Total Payment'] || f['Transfer Amount'] || f.Amount || f['Bill Total']);
   if (!amount) return 'BCA, nominal nggak ketemu';
 
-  const holder = /\b(?:Hi|Hello|Halo|Dear|Yth\.?)\s+([A-Z][A-Z .'-]+?)\s*,/.exec(body)?.[1];
-  const product = (f['Company/Product Name'] || '').split('/').pop().trim() || null; // "DOMPET ANAK BANGSA PT / GoPay" -> "GoPay"
+  const holder = holderOf(body);
+  const product =
+    (f['Company/Product Name'] || '').split('/').pop().trim() || // "DOMPET ANAK BANGSA PT / GoPay" -> "GoPay"
+    eWalletOf(f['Transaction Type']) ||
+    null;
   const toName = f['Beneficiary Name'] || f.Name || null;
   const note = (f.Remarks || f.Description || '').trim();
   const suffix = note && note !== '-' ? ` · ${note}` : '';
@@ -354,12 +441,12 @@ function parseBcaJournal(subject, body) {
       counterparty: toLabel,
     };
   }
-  const counterparty = f['Beneficiary Name'] || f['Merchant Name'] || product || f.Name || null;
+  const counterparty = f['Beneficiary Name'] || f['Payment to'] || f['Merchant Name'] || product || f.Name || null;
   const description = f['Beneficiary Name']
     ? `Transfer ke ${f['Beneficiary Name']}`
     : counterparty
       ? `Bayar ${counterparty}`
-      : f['Transfer Type'] || f['Payment Type'] || 'Transaksi BCA';
+      : f['Transaction Type'] || f['Transfer Type'] || f['Payment Type'] || 'Transaksi BCA';
   return { type: 'expense', amount, description: description + suffix, counterparty };
 }
 
@@ -385,18 +472,22 @@ function detectSource(from, text) {
 }
 
 // Banks decorate subjects with emoji ("…to Marks Gym💸"); the app shows none, so they are dropped on the way in.
+// Subjects can also carry HTML entities ("Printing &amp; Fotoc").
 const stripEmoji = (s) =>
   String(s || '')
+    .replace(/&amp;/g, '&')
     .replace(/[\p{Extended_Pictographic}\u{1F1E6}-\u{1F1FF}\u{FE0F}\u{200D}\u{20E3}]/gu, '')
     .replace(/\s+/g, ' ')
     .trim();
 
-// Clean emoji out of descriptions/subjects synced before this rule existed.
+// Clean emoji out of descriptions/subjects synced before this rule existed, and name Jago payments the way BCA
+// ones are ("You have made a payment to kentang 88" -> "Bayar kentang 88") so both banks share remembered categories.
 {
+  const tidy = (s) => stripEmoji(s).replace(/^You have made a payment to\s+/i, 'Bayar ');
   const fix = (table, idCol, col) => {
     const rows = db.prepare(`SELECT ${idCol} AS id, ${col} AS v FROM ${table}`).all();
     const set = db.prepare(`UPDATE ${table} SET ${col} = ? WHERE ${idCol} = ?`);
-    db.transaction(() => rows.forEach((r) => r.v && stripEmoji(r.v) !== r.v && set.run(stripEmoji(r.v), r.id)))();
+    db.transaction(() => rows.forEach((r) => r.v && tidy(r.v) !== r.v && set.run(tidy(r.v), r.id)))();
   };
   fix('transactions', 'id', 'description');
   fix('gmail_sync_log', 'message_id', 'subject');
@@ -406,9 +497,11 @@ const stripEmoji = (s) =>
 // Bank emails carry a merchant name, not a category, so the category is inferred from the merchant/subject only
 // (never the whole body, whose footers mention unrelated brands).
 
-// "You have made a payment to Marks Gym💸" -> "Marks Gym"
+// "You have made a payment to Marks Gym💸" -> "Marks Gym", and the app's own "Bayar Marks Gym" -> "Marks Gym"
 function merchantOf(text) {
-  const m = /(?:payment|paid|pembayaran|bayar|transaksi)\s+(?:to|ke|kepada|di|at)\s+([^\n.,;]{2,60})/i.exec(text || '');
+  const m =
+    /(?:payment|paid|pembayaran|bayar|transaksi)\s+(?:to|ke|kepada|di|at)\s+([^\n.,;]{2,60})/i.exec(text || '') ||
+    /^Bayar\s+(?!pakai\b)([^\n·]{2,60})/i.exec(text || '');
   return m ? m[1].replace(/[^\p{L}\p{N}&'\s-]/gu, '').replace(/\s+/g, ' ').trim() || null : null;
 }
 
@@ -429,7 +522,7 @@ const CATEGORY_RULES = [
 // Budget category for an expense: the user's own flexible_expenses name when it clearly fits, else a generic label.
 function categorize(subject, merchant, source) {
   const hay = `${merchant || ''} ${subject || ''}`;
-  // 0) Remembered: the category last used for the same payee ("Transfer ke ENDANG PURWATI", "payment to
+  // 0) Remembered: the category last used for the same payee ("Transfer ke SITI AMINAH", "payment to
   //    ketoprak maskur"), ignoring the remark after " · ". Only when there is a payee, so generic notices like
   //    "transaction using your debit card" never inherit one merchant's category.
   const base = String(subject || '').split(' · ')[0].trim();
@@ -476,12 +569,13 @@ function categorize(subject, merchant, source) {
 
 // The everyday wallet ("Pocket Main"); unknown pocket names fall back to it for income/expense.
 // Resolved on every sync because wallets can be renamed, deleted or re-created from the UI:
-// SYNC_MAIN_WALLET in .env > a wallet named/typed "main"/"utama" > seeded liquidCash > the first wallet.
+// the wallet picked in Pengaturan Gmail (or SYNC_MAIN_WALLET in .env) > a wallet named/typed "main"/"utama" >
+// seeded liquidCash > the first wallet.
 function mainWallet() {
   const wallets = db.prepare('SELECT id, name, category FROM wallets ORDER BY rowid').all();
   const byId = (id) => wallets.find((w) => w.id === id)?.id;
   return (
-    byId(process.env.SYNC_MAIN_WALLET) ||
+    byId(mainWalletSetting()) ||
     wallets.find((w) => /\b(main|utama)\b/i.test(`${w.id.replace(/([A-Z])/g, ' $1')} ${w.name} ${w.category}`))?.id ||
     byId('liquidCash') ||
     wallets[0]?.id ||
@@ -641,7 +735,9 @@ const shiftPeriod = (period, n) => {
   const [y, m] = period.split('-').map(Number);
   return new Date(Date.UTC(y, m - 1 + n, 1)).toISOString().slice(0, 7);
 };
+// Day 1 means "on payday", so it follows the period's start when that month's payday was moved (salary on 31 Okt).
 const dueDate = (period, day) => {
+  if (day === 1) return periodStart(period);
   const [y, m] = period.split('-').map(Number);
   const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
   return `${period}-${String(Math.min(day, last)).padStart(2, '0')}`;
@@ -652,9 +748,39 @@ const shiftDay = (date, n) => {
   return d.toISOString().slice(0, 10);
 };
 
+// ---------- Pay periods ----------
+// A "month" in the app (period "2026-11") runs from its payday to the day before the next one. Payday is the 1st
+// unless the user moved it for that month (setting "payday:2026-11" = "2026-10-31"): salary does not always come
+// on the same date, and money received on 31 Okt is November's money.
+const PAYDAY_EARLIEST_DAY = 20; // a payday can move back as far as the 20th of the previous month…
+const PAYDAY_LATEST_DAY = 10; // …or forward to the 10th of its own month
+const paydayKey = (period) => `payday:${period}`;
+const periodStart = (period) => getSetting(paydayKey(period), null) || `${period}-01`;
+const periodEnd = (period) => shiftDay(periodStart(shiftPeriod(period, 1)), -1);
+function periodOf(date) {
+  const p = date.slice(0, 7);
+  if (date >= periodStart(shiftPeriod(p, 1))) return shiftPeriod(p, 1);
+  if (date < periodStart(p)) return shiftPeriod(p, -1);
+  return p;
+}
+const currentPeriod = () => periodOf(wibDate());
+// Allowed paydays for a period: [20th of the previous month, 10th of the month].
+const paydayBounds = (period) => [
+  `${shiftPeriod(period, -1)}-${PAYDAY_EARLIEST_DAY}`,
+  `${period}-${String(PAYDAY_LATEST_DAY).padStart(2, '0')}`,
+];
+// What the UI needs about one period.
+const periodInfo = (period) => ({
+  period,
+  start: periodStart(period),
+  end: periodEnd(period),
+  moved: Boolean(getSetting(paydayKey(period), null)),
+  bounds: paydayBounds(period),
+});
+
 // Periods worth showing for a rule: from its start (at most RECURRING_LOOKBACK months back) through this month.
 function recurringPeriods(rule, today = wibDate()) {
-  const current = today.slice(0, 7);
+  const current = periodOf(today);
   let p = rule.start_period > shiftPeriod(current, -RECURRING_LOOKBACK) ? rule.start_period : shiftPeriod(current, -RECURRING_LOOKBACK);
   const out = [];
   for (; p <= current; p = shiftPeriod(p, 1)) out.push(p);
@@ -794,6 +920,228 @@ function parsePintu(subject, text) {
 const pintuWallet = () =>
   db.prepare('SELECT id, name, category FROM wallets').all().find((w) => /\bpintu\b/i.test(`${w.name} ${w.category}`))?.id || null;
 
+// ---------- Other banks & e-wallets: one general parser ----------
+// Most Indonesian bank notifications are a run of "Label value" (or "Label : value") pairs:
+// "Penerima kentang 88 Jakarta - ID Tanggal … Nominal Transaksi Rp 8.000,00 …" (Livin' by Mandiri). Only mail from
+// these official domains is read; a kind or amount that is not clearly recognised is skipped and shown in the log.
+const BANK_SENDERS = [
+  ['Mandiri', /bankmandiri\.co\.id/i],
+  ['BRI', /\bbri\.co\.id/i],
+  ['BNI', /\bbni\.co\.id/i],
+  ['BSI', /bankbsi\.co\.id/i],
+  ['CIMB Niaga', /cimbniaga\.co\.id/i],
+  ['Permata', /permatabank\.(co\.id|com)/i],
+  ['Danamon', /danamon\.co\.id/i],
+  ['BTN', /\bbtn\.co\.id/i],
+  ['SeaBank', /seabank\.co\.id/i],
+  ['OCBC', /\bocbc\.(id|com)/i],
+  ['Jenius', /\b(btpn|jenius)\.com/i],
+  ['blu', /bcadigital\.co\.id/i],
+  ['Superbank', /superbank\.id/i],
+  ['Allo Bank', /allobank\.com/i],
+  ['DANA', /\bdana\.id/i],
+  ['OVO', /\bovo\.id/i],
+  ['ShopeePay', /shopeepay\.co\.id/i],
+  ['LinkAja', /linkaja\.(id|com)/i],
+];
+const bankOf = (from) => BANK_SENDERS.find(([, re]) => re.test(from))?.[0] || null;
+// The wallet for a bank / e-wallet by whole word in its name or type ("Mandiri", "BRI Tabungan"). Short all-caps
+// names (DANA, OVO, BRI) must match in caps, so a "Dana Darurat" wallet is not the DANA e-wallet.
+function walletNamed(name) {
+  if (!name) return null;
+  const word = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`(^|[^\\p{L}\\p{N}])${word}(?![\\p{L}\\p{N}])`, /^[A-Z]{3,4}$/.test(name) ? 'u' : 'iu');
+  return db.prepare('SELECT id, name, category FROM wallets').all().find((w) => re.test(`${w.name} ${w.category || ''}`))?.id || null;
+}
+
+// Account notices that are not money movements (or cannot be read, like an encrypted statement).
+const BANK_NOTICE_RE =
+  /kode verifikasi|\botp\b|e-?statement|consolidated statement|rekening koran|berhasil dihubungkan|pembukaan rekening|kartu debit virtual|\blogin\b|kata sandi|password|\bpin\b|perubahan data|aktivasi/i;
+const BANK_FAILED_RE = /tidak berhasil|gagal|failed|unsuccessful|ditolak|dibatalkan|kedaluwarsa|expired/i;
+const BANK_KINDS = [
+  { kind: 'income', re: /(dana|uang|transfer) masuk|menerima (dana|uang|transfer)|telah diterima|received|incoming|\bcredited\b|\bkredit\b|refund|pengembalian dana|cashback/i },
+  { kind: 'withdraw', re: /tarik tunai|penarikan tunai|cash withdrawal/i },
+  { kind: 'topup', re: /top.?up|isi ulang|isi saldo/i },
+  { kind: 'transfer', re: /transfer|kirim (uang|dana)|pemindahbukuan/i },
+  { kind: 'payment', re: /pembayaran|bayar|payment|pembelian|purchase|transaksi qris|\bqris\b|\bdebit\b|tagihan/i },
+];
+// Where a labelled value stops: the next label of the same email.
+const BANK_STOP =
+  'Tanggal|Jam|Waktu|Date|Time|Nominal|Jumlah|Total|Biaya|Amount|Fee|No\\.|Nomor|Customer|Keterangan|Berita|Catatan|Remarks|Rekening|Sumber|Source|Status|Merchant PAN|Terminal|Pengakuisisi|Acquirer|Tujuan Transaksi|Simpan|Terima kasih|Bank\\s|\\d{6,}';
+// Labels are tried in the order given (most specific first), so a common word later in the list ("Tujuan")
+// cannot win over a real label just because it appears earlier in the text.
+const bankField = (text, labels) => {
+  for (const label of labels.split('|')) {
+    const v = new RegExp(`\\b${label}\\s*:?\\s+(.+?)\\s*(?=\\b(?:${BANK_STOP})|\\s-\\s|$)`, 'i').exec(text)?.[1]?.trim();
+    if (v) return v;
+  }
+  return null;
+};
+const bankAmount = (text, labels) => {
+  for (const label of labels.split('|')) {
+    const v = parseMoney(new RegExp(`\\b${label}\\s*:?\\s*((?:Rp|IDR)\\.?\\s*\\d[\\d.,]*)`, 'i').exec(text)?.[1]);
+    if (v) return v;
+  }
+  return null;
+};
+// "Bank Central Asia" -> "BCA", the short names wallets are usually called by.
+const BANK_SHORT = [
+  [/central asia/i, 'BCA'],
+  [/syariah indonesia/i, 'BSI'],
+  [/negara indonesia/i, 'BNI'],
+  [/rakyat indonesia/i, 'BRI'],
+  [/tabungan negara/i, 'BTN'],
+  [/^(bank )?mandiri$/i, 'Mandiri'],
+  [/^(bank )?jago$/i, 'Jago'],
+];
+const shortBank = (name) => BANK_SHORT.find(([re]) => re.test(name || ''))?.[1] || (name || '').replace(/^bank\s+/i, '').trim() || null;
+const EWALLETS_RE = /^(gopay|go-pay|ovo|dana|shopeepay|linkaja)$/i;
+
+// { type, kind, amount, description, counterparty, toLabel } for a recognised email, a skip reason string, or null.
+function parseBankEmail(bank, subject, body) {
+  const head = `${subject}\n${body.slice(0, 400)}`;
+  if (BANK_NOTICE_RE.test(subject)) return null;
+  if (BANK_FAILED_RE.test(subject)) return `${bank}, transaksi nggak berhasil`;
+  const kind = (BANK_KINDS.find((k) => k.re.test(subject)) || BANK_KINDS.find((k) => k.re.test(head)))?.kind;
+  if (!kind) return null;
+
+  const amount =
+    bankAmount(body, 'Total Transaksi|Total Pembayaran|Total Payment|Total Transfer|Total Debit|Total') ||
+    bankAmount(body, 'Nominal Transaksi|Nominal Transfer|Nominal Top-?up|Nominal Pembayaran|Jumlah Transfer|Jumlah Pembayaran|Jumlah Dana|Nominal|Jumlah|Amount') ||
+    extractAmount(`${subject}\n${body}`, 0);
+  if (!amount || amount < MIN_AMOUNT) return `${bank}, nominal nggak ketemu`;
+
+  // "e-money ****4138" -> "e-money", "kentang 88 Jakarta - ID" -> "kentang 88 Jakarta"
+  const tidy = (s) => (s ? s.replace(/\s+-\s+ID$/i, '').replace(/\s*\*+\d*$/, '').replace(/\s+/g, ' ').trim() || null : null);
+  const holder = holderOf(body);
+  if (kind === 'income') {
+    const sender = tidy(bankField(body, 'Nama Pengirim|Pengirim|Sender|Dari\\s*:|From\\s*:'));
+    return { type: 'income', kind, amount, description: sender ? `Terima dari ${sender}` : `Uang masuk ${bank}`, counterparty: sender };
+  }
+  if (kind === 'withdraw') return { type: 'expense', kind, amount, description: `Tarik tunai ${bank}`, counterparty: null };
+  if (kind === 'topup') {
+    const provider = tidy(bankField(body, 'Penyedia Jasa|Penyedia|Provider|Produk|Tujuan\\s*:'));
+    const name = /^go-?pay$/i.test(provider || '') ? 'GoPay' : provider;
+    // Topping up your own e-wallet moves money (a GoPay -> Jago move later folds into it); a toll / e-money card
+    // top up is spending.
+    return EWALLETS_RE.test(provider || '')
+      ? { type: 'transfer', kind, amount, description: `Top up ${name}`, counterparty: name, toLabel: name }
+      : { type: 'expense', kind, amount, description: `Top up ${name || 'e-wallet'}`, counterparty: name };
+  }
+  const name = tidy(bankField(body, 'Nama Penerima|Penerima|Nama Merchant|Merchant|Payment to|Beneficiary Name|Kepada|Tujuan\\s*:'));
+  if (kind === 'transfer') {
+    const toBank = shortBank(/\b(Bank [A-Za-z ]+?|BCA|BNI|BRI|BSI|BTN|CIMB Niaga|Permata|Danamon|SeaBank|Jago|Jenius|blu)\s+[-•]\s*[\d*]{4,}/.exec(body)?.[1]);
+    if (name && toBank && sameName(name, holder)) {
+      return { type: 'transfer', kind: 'own', amount, description: `Transfer ke ${toBank}`, counterparty: toBank, toLabel: toBank };
+    }
+    return { type: 'expense', kind, amount, description: name ? `Transfer ke ${name}` : `Transfer ${bank}`, counterparty: name };
+  }
+  return { type: 'expense', kind, amount, description: name ? `Bayar ${name}` : `Pembayaran ${bank}`, counterparty: name };
+}
+
+// ---------- Bibit (mutual funds): purchases, units, redemptions ----------
+// One purchase sends two emails sharing an order number: "Pembayaran kamu sudah berhasil diterima" (money left the
+// bank) and a day later "Unit Reksa Dana Kamu Sudah Masuk" (exact units at the real NAV). A redemption ends with
+// "Dana Berhasil Dicairkan" (money arrived in the bank). Bodies are "Label value" runs; amounts are "Rp300,000".
+const BIBIT_SENDER_RE = /no-reply@bibit\.id/i;
+const BIBIT_NEXT_LABEL =
+  'Order ID|Nominal|Tanggal|Metode|Reference No|Nama Reksa Dana|Biaya|Nilai|Jumlah Unit|NAV|Kode Unik|Bank Penerima|No\\. Rekening|Nama Penerima|Aktifkan|Jika ada|Terima kasih';
+const bibitField = (text, label) =>
+  new RegExp(`${label}\\s*:?\\s*(.+?)\\s*(?=\\b(?:${BIBIT_NEXT_LABEL})\\b|$)`, 'i').exec(text)?.[1] || null;
+const bibitRupiah = (s) => (s && /Rp/i.test(s) ? Number(s.replace(/[^\d]/g, '')) || null : null); // no decimals
+const bibitUnits = (s) => (s ? Number(s.replace(/,/g, '').match(/\d+(?:\.\d+)?/)?.[0]) || null : null);
+// "REKSA DANA SYARIAH MAJORIS PASAR UANG SYARIAH INDONESIA" -> "Majoris Pasar Uang Syariah Indonesia"
+const bibitFundName = (s) =>
+  String(s || '')
+    .replace(/^reksa dana\s+(syariah\s+)?/i, '')
+    .toLowerCase()
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+
+function parseBibit(subject, body) {
+  const order = (bibitField(body, 'Order ID Pembayaran') || bibitField(body, 'Nomor Order') || '').split(/\s/)[0] || null;
+  const fund = bibitFundName(bibitField(body, 'Nama Reksa Dana'));
+  if (/pembayaran kamu sudah berhasil/i.test(subject)) {
+    const amount = bibitRupiah(bibitField(body, 'Nominal Pembelian'));
+    const paid = bibitRupiah(bibitField(body, 'Nominal Terverifikasi')) || amount;
+    return amount && { kind: 'buy', order, fund, amount, fee: paid - amount, method: bibitField(body, 'Metode Pembayaran') };
+  }
+  if (/unit reksa dana kamu sudah masuk/i.test(subject)) {
+    const amount = bibitRupiah(bibitField(body, 'Nilai Pembelian'));
+    const units = bibitUnits(bibitField(body, 'Jumlah Unit'));
+    return amount && units && { kind: 'units', order, fund, amount, units };
+  }
+  if (/dana berhasil dicairkan/i.test(subject)) {
+    const amount = bibitRupiah(bibitField(body, 'Nilai Transfer yang Diterima')) || bibitRupiah(bibitField(body, 'Nilai Penjualan'));
+    return amount && { kind: 'sell', order, fund, amount, bank: bibitField(body, 'Bank Penerima') };
+  }
+  return null; // "Penjualan dalam proses", "Lakukan pembayaran", account notices: nothing moved yet
+}
+
+// The fund's wallet: a Bibit / Pasardana-linked wallet sharing the most name words with the fund
+// ("RDPU Majoris Pasar Uang Syariah" <- "Majoris Pasar Uang Syariah Indonesia"), or the only one there is.
+function fundWallet(fund) {
+  const wallets = db
+    .prepare('SELECT id, name, category, asset FROM wallets')
+    .all()
+    .filter((w) => /\bbibit\b/i.test(`${w.name} ${w.category}`) || String(w.asset || '').startsWith('fund:'));
+  const words = (s) => String(s || '').toLowerCase().split(/[^a-z0-9]+/).filter((x) => x.length >= 4 && !/^(reksa|dana|syariah|indonesia)$/.test(x));
+  const wanted = new Set(words(fund));
+  const [best] = wallets
+    .map((w) => ({ w, score: words(w.name).filter((x) => wanted.has(x)).length }))
+    .sort((a, b) => b.score - a.score);
+  return best && (best.score > 0 || wallets.length === 1) ? best.w : null;
+}
+
+// A bank / payment method named in the email ("Jago Dana Darurat", "Bank Jago", "BCA") -> wallet id, or null.
+function bankWallet(name) {
+  const n = String(name || '').replace(/^bank\s+/i, '').trim();
+  if (/^jago$/i.test(n)) return mainWallet();
+  return walletForPocket(n.replace(/^jago\s+/i, '')) || null;
+}
+
+// A transfer already recorded for this fund move (from the bank's email, the other Bibit email, or typed in),
+// same amount within a day either side. `col` is 'to_wallet' for purchases and 'wallet' for redemptions.
+const fundTwin = (col, wallet, amount, day, source) =>
+  db
+    .prepare(
+      `SELECT * FROM transactions WHERE type = 'transfer' AND ${col} = ? AND amount = ? AND date BETWEEN ? AND ?
+         AND source != ? ORDER BY id DESC LIMIT 1`
+    )
+    .get(wallet, amount, shiftDay(day, -1), shiftDay(day, 1), source);
+
+// "Unit sudah masuk": the purchase was recorded as a transfer into the fund wallet, which bought units at the last
+// known NAV (or bought none when the paying pocket is not a wallet here). The email has the exact units, so the
+// wallet is corrected to them. Returns the log target, or null when the units are already in a typed-in balance.
+const applyFundUnits = db.transaction(({ messageId, subject, wallet, order, amount, units, date }) => {
+  const w = db.prepare('SELECT * FROM wallets WHERE id = ?').get(wallet);
+  const day = wibDate(Date.parse(date));
+  const byOrder = `%${order || '\u0000'}%`;
+  const buy = db
+    .prepare(
+      `SELECT * FROM transactions WHERE type = 'transfer' AND to_wallet = ?
+         AND (description LIKE ? OR (amount = ? AND date BETWEEN ? AND ?))
+       ORDER BY description LIKE ? DESC, id DESC LIMIT 1`
+    )
+    .get(wallet, byOrder, amount, shiftDay(day, -7), day, byOrder);
+  if (buy && !buy.applied) return null;
+  const counted = Boolean(buy?.wallet); // both sides known: the transfer already moved the balance
+  const priced = Boolean(w.asset) && w.price > 0;
+  const unitsDelta = w.asset ? units - (counted && priced ? buy.amount / w.price : 0) : 0;
+  const newUnits = (w.units || 0) + unitsDelta;
+  const balanceDelta = priced ? Math.round(newUnits * w.price) - w.balance : counted ? 0 : amount;
+  db.prepare('UPDATE wallets SET units = ?, balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(
+    w.asset ? newUnits : w.units,
+    balanceDelta,
+    wallet
+  );
+  const target = `${w.name} · ${units.toLocaleString('id-ID', { maximumFractionDigits: 4 })} unit`;
+  db.prepare(
+    `INSERT INTO gmail_sync_log (message_id, subject, source, type, amount, target, wallet, email_date, units)
+     VALUES (?, ?, 'Bibit', 'transfer', ?, ?, ?, ?, ?)`
+  ).run(messageId, subject, balanceDelta, target, wallet, date, unitsDelta);
+  return target;
+});
+
 // Paying an investment app (Bibit, Pintu, …) from a bank is a move into your own wallet for it, not spending.
 const INVEST_APP_RE = /\b(bibit|bareksa|ajaib|pluang|stockbit|pintu|indodax|tokocrypto|nanovest)\b/i;
 function investWalletFor(merchant) {
@@ -841,7 +1189,10 @@ const revertTransaction = db.transaction((row) => {
   const ledger = db.prepare('SELECT * FROM transactions WHERE message_id = ?').get(row.message_id);
   if (ledger) return deleteLedgerRow(ledger);
 
-  if (row.type === 'income') {
+  if (row.units != null) {
+    // Bibit "unit sudah masuk": only corrected the fund wallet's units and balance.
+    db.prepare('UPDATE wallets SET units = units - ?, balance = balance - ? WHERE id = ?').run(row.units, row.amount, row.wallet);
+  } else if (row.type === 'income') {
     adjustWallet.run(-row.amount, row.wallet || row.target);
   } else if (row.type === 'transfer') {
     const [from, to] = String(row.target).split(' → ');
@@ -858,21 +1209,22 @@ const revertTransaction = db.transaction((row) => {
   db.prepare('UPDATE gmail_sync_log SET reverted = 1 WHERE message_id = ?').run(row.message_id);
 });
 
+const gmailClient = ({ user, pass }) =>
+  new ImapFlow({ host: 'imap.gmail.com', port: 993, secure: true, auth: { user, pass }, logger: false });
+
 async function syncGmailTransactions() {
-  const { GMAIL_USER, GMAIL_APP_PASS } = process.env;
-  if (!GMAIL_USER || !GMAIL_APP_PASS || GMAIL_USER.startsWith('email_lu')) {
-    const err = new Error('GMAIL_USER / GMAIL_APP_PASS belum diisi di file .env');
+  const config = gmailConfig();
+  if (!gmailConfigured(config)) {
+    const err = new Error('Gmail belum dihubungin. Isi email & App Password di Pengaturan Gmail dulu, ya.');
     err.status = 400;
+    err.code = 'gmail_not_configured';
     throw err;
   }
+  const SYNC_START = config.start;
+  const SYNC_START_TIME = syncStartTime(SYNC_START);
+  const GMAIL_QUERY = gmailQuery(SYNC_START);
 
-  const client = new ImapFlow({
-    host: 'imap.gmail.com',
-    port: 993,
-    secure: true,
-    auth: { user: GMAIL_USER, pass: GMAIL_APP_PASS.replace(/\s+/g, '') },
-    logger: false,
-  });
+  const client = gmailClient(config);
 
   const details = [];
   const skipped = {}; // reason -> count, so the UI can explain why nothing was applied
@@ -903,9 +1255,49 @@ async function syncGmailTransactions() {
     await client.logout().catch(() => {});
   }
 
+  // Readable text of a message (text/plain preferred, else text/html stripped of tags).
+  async function bodyOf(msg) {
+    const textPart = findTextPart(msg.bodyStructure);
+    if (!textPart) return '';
+    const { content } = await client.download(msg.uid, textPart.part, { uid: true, maxBytes: 512 * 1024 });
+    if (!content) return '';
+    const body = await streamToString(content);
+    return textPart.type === 'text/html' ? htmlToText(body) : body;
+  }
+
+  // Rows synced before the payee was read from the body ("You have made a transfer", "Transaksi BCA") get their
+  // description rewritten from the original email. Only the wording changes, never the amount or the wallets.
+  async function renameGenericRows() {
+    const rows = db
+      .prepare(
+        `SELECT id, message_id, source, type, description, category FROM transactions
+         WHERE message_id IS NOT NULL AND message_id NOT LIKE 'uid:%' AND date >= ?
+           AND ((source = 'Jago' AND description IN ('You have made a transfer', 'You have done an e-Wallet top up',
+                                                     'You have made a transaction using your debit card'))
+             OR (source = 'BCA' AND description = 'Transaksi BCA'))`
+      )
+      .all(SYNC_START);
+    for (const row of rows) {
+      const [uid] = (await client.search({ gmraw: `rfc822msgid:${row.message_id}` }, { uid: true })) || [];
+      if (!uid) continue;
+      const msg = await client.fetchOne(uid, { envelope: true, bodyStructure: true }, { uid: true });
+      const subject = stripEmoji((msg.envelope?.subject || '').replace(/^\s*((fwd?|fw|tr)\s*:\s*)+/i, ''));
+      const body = await bodyOf(msg);
+      const bca = row.source === 'BCA' ? parseBcaJournal(subject, body) : null;
+      const payee = row.source === 'Jago' ? jagoPayee(body) : null;
+      const description = bca ? (typeof bca === 'string' ? null : bca.description) : jagoDescription(subject, payee, holderOf(body));
+      if (!description || description === row.description) continue;
+      const category =
+        row.category || (row.type === 'expense' ? categorize(description, bca?.counterparty || payee?.name, row.source) : null);
+      db.prepare('UPDATE transactions SET description = ?, category = ? WHERE id = ?').run(description, category, row.id);
+      db.prepare('UPDATE gmail_sync_log SET subject = ? WHERE message_id = ?').run(description, row.message_id);
+    }
+  }
+
   async function syncMailbox(mailbox) {
     const lock = await client.getMailboxLock(mailbox);
     try {
+      await renameGenericRows();
       const uids = (await client.search({ gmraw: GMAIL_QUERY }, { uid: true })) || [];
       const recent = uids.slice(-GMAIL_MAX_MESSAGES);
 
@@ -938,15 +1330,7 @@ async function syncGmailTransactions() {
           continue;
         }
 
-        let body = '';
-        const textPart = findTextPart(msg.bodyStructure);
-        if (textPart) {
-          const { content } = await client.download(msg.uid, textPart.part, { uid: true, maxBytes: 512 * 1024 });
-          if (content) {
-            body = await streamToString(content);
-            if (textPart.type === 'text/html') body = htmlToText(body);
-          }
-        }
+        const body = await bodyOf(msg);
 
         // Guardrail B (body).
         if (NEWSLETTER_WORDS_RE.test(body)) {
@@ -955,30 +1339,112 @@ async function syncGmailTransactions() {
         }
 
         const text = `${subject}\n${body}`;
-        const isBca = BCA_SENDER_RE.test(from) || BCA_BODY_RE.test(body);
-        const isJago = !isBca && (JAGO_SENDER_RE.test(from) || JAGO_BODY_RE.test(body));
-        const isPintu = !isBca && !isJago && PINTU_SENDER_RE.test(from);
+        const isBibit = BIBIT_SENDER_RE.test(from);
+        const isBca = !isBibit && (BCA_SENDER_RE.test(from) || BCA_BODY_RE.test(body));
+        const isJago = !isBibit && !isBca && (JAGO_SENDER_RE.test(from) || JAGO_BODY_RE.test(body));
+        const isPintu = !isBibit && !isBca && !isJago && PINTU_SENDER_RE.test(from);
+        const otherBank = !isBibit && !isBca && !isJago && !isPintu ? bankOf(from) : null;
+        const date = (msg.envelope?.date ? new Date(msg.envelope.date) : new Date()).toISOString();
+        const day = wibDate(Date.parse(date));
 
         // Turn the email into one transaction: { type, amount, description, source, wallets, category, phrase }.
         let tx;
-        if (isBca) {
+        let fee = 0;
+        if (isBibit) {
+          const b = parseBibit(subject, body);
+          if (!b) {
+            skip('Bibit, bukan email transaksi');
+            continue;
+          }
+          const fund = fundWallet(b.fund);
+          if (!fund) {
+            skip(`Bibit, wallet reksa dana "${b.fund}" belum ada`);
+            continue;
+          }
+          if (b.kind === 'units') {
+            const target = applyFundUnits({ messageId, subject, wallet: fund.id, order: b.order, amount: b.amount, units: b.units, date });
+            if (!target) {
+              logDuplicate.run(messageId, subject, 'Bibit', 'transfer', b.amount, date, 0);
+              skip('Bibit, unit udah ada di saldo');
+              continue;
+            }
+            details.push({ message_id: messageId, subject, source: 'Bibit', type: 'TRANSFER', amount: b.amount, target, phrase: 'unit sudah masuk', mailbox, date });
+            continue;
+          }
+          const order = b.order ? ` · ${b.order}` : '';
+          if (b.kind === 'buy') {
+            tx = {
+              type: 'transfer',
+              amount: b.amount,
+              description: `Beli ${b.fund} di Bibit${order}`,
+              source: 'Bibit',
+              phrase: 'pembayaran berhasil',
+              wallets: { from: bankWallet(b.method), to: fund.id, fromLabel: b.method || 'Bank', toLabel: fund.name },
+              category: null,
+              twin: ['to_wallet', fund.id],
+            };
+            fee = Math.max(0, b.fee || 0);
+          } else {
+            tx = {
+              type: 'transfer',
+              amount: b.amount,
+              description: `Jual ${b.fund} di Bibit${order}`,
+              source: 'Bibit',
+              phrase: 'dana dicairkan',
+              wallets: { from: fund.id, to: bankWallet(b.bank), fromLabel: fund.name, toLabel: b.bank || 'Bank' },
+              category: null,
+              twin: ['wallet', fund.id],
+            };
+          }
+        } else if (isBca) {
           const bca = parseBcaJournal(subject, body);
           if (!bca || typeof bca === 'string') {
             skip(bca || 'BCA, bukan email transaksi');
             continue;
           }
           const bcaWallet = walletForPocket('BCA'); // a wallet named/typed "BCA", if there is one
+          const investTo = bca.type === 'expense' ? investWalletFor(bca.counterparty) : null;
           tx = {
-            type: bca.type,
+            type: investTo ? 'transfer' : bca.type,
             amount: bca.amount,
             description: bca.description,
             source: 'BCA',
             phrase: 'Internet Transaction Journal',
-            wallets:
-              bca.type === 'transfer'
+            wallets: investTo
+              ? { from: bcaWallet, to: investTo, fromLabel: 'BCA', toLabel: bca.counterparty }
+              : bca.type === 'transfer'
                 ? { from: bcaWallet, to: walletForPocket(bca.toLabel), fromLabel: 'BCA', toLabel: bca.toLabel }
                 : { wallet: bcaWallet, label: 'BCA' },
-            category: bca.type === 'expense' ? categorize(bca.description, bca.counterparty, 'BCA') : null,
+            category: bca.type === 'expense' && !investTo ? categorize(bca.description, bca.counterparty, 'BCA') : null,
+            twin: investTo ? ['to_wallet', investTo] : null,
+          };
+        } else if (otherBank) {
+          const p = parseBankEmail(otherBank, subject, body);
+          if (!p || typeof p === 'string') {
+            skip(p || `${otherBank}, bukan email transaksi`);
+            continue;
+          }
+          const own = walletNamed(otherBank); // a wallet called "Mandiri", "BRI", …, if there is one
+          const investTo = p.type === 'expense' ? investWalletFor(p.counterparty) : null;
+          const withdrawTo = p.kind === 'withdraw' ? cashWallet() : null;
+          tx = {
+            type: investTo || withdrawTo ? 'transfer' : p.type,
+            amount: p.amount,
+            description: p.description,
+            source: otherBank,
+            phrase: p.kind,
+            wallets:
+              p.type === 'income'
+                ? { wallet: own, label: otherBank }
+                : investTo
+                  ? { from: own, to: investTo, fromLabel: otherBank, toLabel: p.counterparty }
+                  : withdrawTo
+                    ? { from: own, to: withdrawTo, fromLabel: otherBank, toLabel: null }
+                    : p.type === 'transfer'
+                      ? { from: own, to: walletNamed(p.toLabel) || walletForPocket(p.toLabel), fromLabel: otherBank, toLabel: p.toLabel }
+                      : { wallet: own, label: otherBank },
+            category: p.type === 'expense' && !investTo && !withdrawTo ? categorize(p.description, p.counterparty, otherBank) : null,
+            twin: investTo ? ['to_wallet', investTo] : null,
           };
         } else if (isPintu) {
           // Rupiah moving in or out of the Pintu account: always a move between your own wallets.
@@ -1022,24 +1488,35 @@ async function syncGmailTransactions() {
             continue;
           }
           const source = detectSource(from, text);
-          const merchant = merchantOf(text);
+          const payee = isJago ? jagoPayee(body) : null;
+          const merchant = payee?.name || merchantOf(text);
           const investTo = rule.type === 'expense' ? investWalletFor(merchant) : null;
+          const paidFrom = resolveWallets('expense', text).wallet;
+          // Jago transfer to an account in your own name at another bank ("To BUDI SANTOSO BCA • 1234…"): a move into
+          // that bank's wallet, not spending.
+          const ownTo =
+            isJago && rule.type === 'expense' && !investTo && payee?.bank && sameName(payee.name, holderOf(body))
+              ? walletForPocket(payee.bank)
+              : null;
+          const ownTransfer = Boolean(ownTo && ownTo !== paidFrom);
+          const description = isJago ? jagoDescription(subject, payee, holderOf(body)) : subject;
           tx = {
-            type: investTo ? 'transfer' : rule.type,
+            type: investTo || ownTransfer ? 'transfer' : rule.type,
             amount,
-            description: subject,
+            description,
             source,
             phrase: rule.phrase,
             wallets: withdrawTo
-              ? { from: resolveWallets('expense', text).wallet, to: withdrawTo, fromLabel: null, toLabel: null }
+              ? { from: paidFrom, to: withdrawTo, fromLabel: null, toLabel: null }
               : investTo
-                ? { from: resolveWallets('expense', text).wallet, to: investTo, fromLabel: null, toLabel: merchant }
-                : resolveWallets(rule.type, text),
-            category: rule.type === 'expense' && !investTo ? categorize(subject, merchant, source) : null,
+                ? { from: paidFrom, to: investTo, fromLabel: null, toLabel: merchant }
+                : ownTransfer
+                  ? { from: paidFrom, to: ownTo, fromLabel: null, toLabel: payee.bank }
+                  : resolveWallets(rule.type, text),
+            category: rule.type === 'expense' && !investTo && !ownTransfer ? categorize(description, merchant, source) : null,
+            twin: investTo ? ['to_wallet', investTo] : null,
           };
         }
-        const date = (msg.envelope?.date ? new Date(msg.envelope.date) : new Date()).toISOString();
-        const day = wibDate(Date.parse(date));
 
         // The same notification sent twice within minutes: count it once (checked before any merging below).
         if (nearDuplicate.get(tx.source, tx.type, tx.description, date)) {
@@ -1048,8 +1525,14 @@ async function syncGmailTransactions() {
           continue;
         }
 
+        // A fund purchase / redemption announced by both the bank and Bibit (or typed in by hand): counted once.
+        if (tx.twin && fundTwin(tx.twin[0], tx.twin[1], tx.amount, day, tx.source)) {
+          logDuplicate.run(messageId, tx.description, tx.source, tx.type, tx.amount, date, 0);
+          skip('investasi udah tercatat');
+          continue;
+        }
+
         // One own-account move, two emails: keep a single transfer (minus any admin fee).
-        let fee = 0;
         if (tx.type === 'transfer') {
           // The receiving bank's "money in" came first: fold it into this transfer (and learn the destination).
           const twin = incomeTwin(tx.amount, day, tx.wallets.to || null, tx.source);
@@ -1299,6 +1782,26 @@ const toNumber = (v) => {
   return Number.isFinite(n) ? n : null;
 };
 
+// Recording streak: consecutive WIB days with at least one ledger row. It ends today, or yesterday while today has
+// nothing yet, so the day is not counted as missed before it is over. `best` is the longest run ever.
+function recordingStreak() {
+  const today = wibDate();
+  const days = db
+    .prepare('SELECT DISTINCT date FROM transactions WHERE date <= ? ORDER BY date')
+    .all(today)
+    .map((r) => r.date);
+  const has = new Set(days);
+  let current = 0;
+  for (let d = has.has(today) ? today : shiftDay(today, -1); has.has(d); d = shiftDay(d, -1)) current++;
+  let best = 0;
+  let run = 0;
+  days.forEach((d, i) => {
+    run = i > 0 && shiftDay(days[i - 1], 1) === d ? run + 1 : 1;
+    best = Math.max(best, run);
+  });
+  return { current, best, today: has.has(today) };
+}
+
 app.get('/api/dashboard', (req, res) => {
   const wallets = listWallets();
   const expenses = db.prepare('SELECT * FROM flexible_expenses ORDER BY id').all();
@@ -1323,9 +1826,10 @@ app.get('/api/dashboard', (req, res) => {
     planStart: planStart(),
     actual: actualMonth(),
     mainWallet: mainWallet(),
-    sync: { start: SYNC_START, lastSync },
+    sync: { start: gmailConfig().start, lastSync, configured: gmailConfigured(gmailConfig()) },
     recurring: recurringStatus(),
     ledgerStart: db.prepare('SELECT MIN(date) d FROM transactions').get().d,
+    streak: recordingStreak(),
   });
 });
 
@@ -1490,15 +1994,16 @@ app.put('/api/settings/plan-start', (req, res) => {
   res.json({ planStart: planStart() });
 });
 
-// Real income / expense for the current month (WIB) from the ledger. Transfers are net zero, so left out.
+// Real income / expense for the current pay period (WIB) from the ledger. Transfers are net zero, so left out.
 function actualMonth() {
-  const month = wibDate().slice(0, 7);
+  const month = currentPeriod();
+  const range = [periodStart(month), periodEnd(month)];
   const rows = db
     .prepare(
       `SELECT type, SUM(amount) AS total, COUNT(*) AS n FROM transactions
-       WHERE substr(date, 1, 7) = ? AND type IN ('income', 'expense') GROUP BY type`
+       WHERE date BETWEEN ? AND ? AND type IN ('income', 'expense') GROUP BY type`
     )
-    .all(month);
+    .all(...range);
   const get = (type) => rows.find((r) => r.type === type) || { total: 0, n: 0 };
   const income = get('income').total;
   const expense = get('expense').total;
@@ -1506,33 +2011,59 @@ function actualMonth() {
   const byCategory = db
     .prepare(
       `SELECT NULLIF(TRIM(category), '') AS category, SUM(amount) AS total, COUNT(*) AS n FROM transactions
-       WHERE substr(date, 1, 7) = ? AND type = 'expense' GROUP BY 1 ORDER BY total DESC`
+       WHERE date BETWEEN ? AND ? AND type = 'expense' GROUP BY 1 ORDER BY total DESC`
     )
-    .all(month);
-  return { month, income, expense, net: income - expense, count: get('income').n + get('expense').n, byCategory };
+    .all(...range);
+  return {
+    month,
+    start: range[0],
+    end: range[1],
+    income,
+    expense,
+    net: income - expense,
+    count: get('income').n + get('expense').n,
+    byCategory,
+    // This period and the next, for the "tanggal gajian" setting.
+    periods: [periodInfo(month), periodInfo(shiftPeriod(month, 1))],
+  };
 }
 
-// Monthly recap (default: last month). Budgets are compared at their current amounts (no history is kept).
+// Moves one period's payday ({ period: '2026-11', date: '2026-10-31' }), or back to the 1st with date null.
+app.put('/api/settings/payday', (req, res) => {
+  const period = String(req.body.period || '');
+  if (!/^\d{4}-\d{2}$/.test(period)) return res.status(400).json({ error: 'Periode nggak valid' });
+  const date = req.body.date ? String(req.body.date) : null;
+  const [min, max] = paydayBounds(period);
+  if (date && (!DATE_ONLY_RE.test(date) || date < min || date > max)) {
+    return res.status(400).json({ error: `Tanggal gajiannya harus antara ${min} dan ${max}` });
+  }
+  if (!date || date === `${period}-01`) db.prepare('DELETE FROM settings WHERE key = ?').run(paydayKey(period));
+  else setSetting(paydayKey(period), date);
+  res.json(periodInfo(period));
+});
+
+// Monthly recap (default: last period). Budgets are compared at their current amounts (no history is kept).
 app.get('/api/recap', (req, res) => {
-  const current = wibDate().slice(0, 7);
+  const current = currentPeriod();
   const month = /^\d{4}-\d{2}$/.test(req.query.month || '') ? req.query.month : shiftPeriod(current, -1);
+  const rangeOf = (m) => [periodStart(m), periodEnd(m)];
   const totals = (m) => {
     const rows = db
       .prepare(
         `SELECT type, SUM(amount) AS total, COUNT(*) AS n FROM transactions
-         WHERE substr(date, 1, 7) = ? AND type IN ('income', 'expense') GROUP BY type`
+         WHERE date BETWEEN ? AND ? AND type IN ('income', 'expense') GROUP BY type`
       )
-      .all(m);
+      .all(...rangeOf(m));
     const get = (type) => rows.find((r) => r.type === type) || { total: 0, n: 0 };
     // Day-to-day spending: expenses minus the ones settling a schedule (transfer to Ibu, bills), which would
     // otherwise dominate the per-day comparison.
     const daily = db
       .prepare(
         `SELECT COALESCE(SUM(amount), 0) AS total FROM transactions
-         WHERE substr(date, 1, 7) = ? AND type = 'expense'
+         WHERE date BETWEEN ? AND ? AND type = 'expense'
            AND id NOT IN (SELECT transaction_id FROM recurring_runs WHERE transaction_id IS NOT NULL)`
       )
-      .get(m).total;
+      .get(...rangeOf(m)).total;
     return { income: get('income').total, expense: get('expense').total, daily, count: get('income').n + get('expense').n };
   };
   const now = totals(month);
@@ -1541,9 +2072,9 @@ app.get('/api/recap', (req, res) => {
   const byCategory = db
     .prepare(
       `SELECT NULLIF(TRIM(category), '') AS category, SUM(amount) AS total, COUNT(*) AS n FROM transactions
-       WHERE substr(date, 1, 7) = ? AND type = 'expense' GROUP BY 1 ORDER BY total DESC`
+       WHERE date BETWEEN ? AND ? AND type = 'expense' GROUP BY 1 ORDER BY total DESC`
     )
-    .all(month);
+    .all(...rangeOf(month));
   const spentOf = (name) => byCategory.find((c) => c.category?.toLowerCase() === name.trim().toLowerCase())?.total || 0;
   const budgets = db
     .prepare('SELECT name, amount FROM flexible_expenses ORDER BY id')
@@ -1552,17 +2083,17 @@ app.get('/api/recap', (req, res) => {
   const biggest = db
     .prepare(
       `SELECT date, amount, description, category FROM transactions
-       WHERE substr(date, 1, 7) = ? AND type = 'expense' ORDER BY amount DESC LIMIT 1`
+       WHERE date BETWEEN ? AND ? AND type = 'expense' ORDER BY amount DESC LIMIT 1`
     )
-    .get(month);
-  // Days counted for the daily average: the whole month, or so far if it is the current one; never before the
-  // first recorded day (the ledger starts mid-September), so a partial first month compares fairly.
+    .get(...rangeOf(month));
+  // Days counted for the daily average: the whole period, or so far if it is the current one; never before the
+  // first recorded day (the ledger starts mid-September), so a partial first period compares fairly.
   const first = db.prepare('SELECT MIN(date) d FROM transactions').get().d;
   const daysIn = (mon) => {
-    const [y, m] = mon.split('-').map(Number);
-    const lastDay = mon === current ? Number(wibDate().slice(8, 10)) : new Date(Date.UTC(y, m, 0)).getUTCDate();
-    const firstDay = first && first.slice(0, 7) === mon ? Number(first.slice(8, 10)) : 1;
-    return Math.max(1, lastDay - firstDay + 1);
+    const [start, end] = rangeOf(mon);
+    const from = first && first > start ? first : start;
+    const to = mon === current ? wibDate() : end;
+    return Math.max(1, Math.round((Date.parse(to) - Date.parse(from)) / 86400000) + 1);
   };
 
   const recurring = db
@@ -1573,10 +2104,14 @@ app.get('/api/recap', (req, res) => {
       return { name: r.name, type: r.type, amount: r.amount, status: run?.status || 'pending' };
     });
 
-  const months = db
-    .prepare('SELECT DISTINCT substr(date, 1, 7) m FROM transactions ORDER BY m DESC')
-    .all()
-    .map((r) => r.m);
+  const months = [
+    ...new Set(
+      db
+        .prepare('SELECT DISTINCT date FROM transactions ORDER BY date DESC')
+        .all()
+        .map((r) => periodOf(r.date))
+    ),
+  ];
 
   res.json({
     month,
@@ -1788,8 +2323,8 @@ app.get('/api/transactions', (req, res) => {
       params.push(type);
     }
     if (month) {
-      where.push('substr(date, 1, 7) = ?');
-      params.push(month);
+      where.push('date BETWEEN ? AND ?');
+      params.push(periodStart(month), periodEnd(month));
     }
     if (uncategorized) where.push(UNCATEGORIZED_SQL);
   } else {
@@ -1812,6 +2347,7 @@ app.get('/api/transactions', (req, res) => {
   res.json({
     date: filtered ? null : date,
     today: wibDate(),
+    period: currentPeriod(),
     filtered,
     rows,
     totals: { income: sum('income'), expense: sum('expense'), transfer: sum('transfer') },
@@ -1945,14 +2481,81 @@ app.post('/api/sync-log/revert', (req, res) => {
   res.json({ success: true, wallets: listWallets() });
 });
 
+const GMAIL_LOGIN_FAILED = 'Login Gmail gagal. Cek email & App Password-nya (harus App Password, bukan password Gmail biasa).';
+
 app.post('/api/sync-gmail', async (req, res) => {
   try {
     res.json(await syncGmailTransactions());
   } catch (e) {
-    const message = e.authenticationFailed
-      ? 'Login Gmail gagal. Cek GMAIL_USER & GMAIL_APP_PASS (harus App Password, bukan password biasa).'
-      : e.message;
-    res.status(e.status || 500).json({ success: false, error: message });
+    const message = e.authenticationFailed ? GMAIL_LOGIN_FAILED : e.message;
+    res.status(e.status || 500).json({ success: false, error: message, code: e.code || null });
+  }
+});
+
+// ---------- Pengaturan Gmail ----------
+// The App Password never leaves the server; the UI only learns whether one is saved.
+const gmailSettings = () => {
+  const c = gmailConfig();
+  return {
+    user: c.user,
+    hasPassword: Boolean(c.pass),
+    start: c.start,
+    mainWallet: mainWalletSetting(),
+    guessedMainWallet: mainWallet(),
+    configured: gmailConfigured(c),
+    fromEnv: !getSetting('gmail_user', null) && Boolean(process.env.GMAIL_USER),
+  };
+};
+
+// { user, pass, start, mainWallet }: a blank pass keeps the saved one. { disconnect: true } forgets the login.
+function readGmailBody(body) {
+  const current = gmailConfig();
+  const user = body.user !== undefined ? String(body.user).trim() : current.user;
+  const pass = body.pass ? String(body.pass).replace(/\s+/g, '') : current.pass;
+  const start = body.start !== undefined ? String(body.start) : current.start;
+  if (user && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(user)) return { error: 'Format email-nya belum bener' };
+  if (pass && !/^[a-z]{16}$/i.test(pass)) return { error: 'App Password Gmail itu 16 huruf (spasi boleh)' };
+  if (!DATE_ONLY_RE.test(start)) return { error: 'Tanggal mulai baca email nggak valid' };
+  return { value: { user, pass, start } };
+}
+
+app.get('/api/settings/gmail', (req, res) => res.json(gmailSettings()));
+
+app.put('/api/settings/gmail', (req, res) => {
+  if (req.body.disconnect) {
+    db.prepare("DELETE FROM settings WHERE key IN ('gmail_user', 'gmail_app_pass')").run();
+    return res.json(gmailSettings());
+  }
+  const { value, error } = readGmailBody(req.body);
+  if (error) return res.status(400).json({ error });
+  if (req.body.mainWallet !== undefined && req.body.mainWallet && !walletExists(req.body.mainWallet)) {
+    return res.status(400).json({ error: 'Wallet utamanya nggak ketemu' });
+  }
+  db.transaction(() => {
+    setSetting('gmail_user', value.user);
+    setSetting('gmail_app_pass', value.pass);
+    setSetting('sync_start', value.start);
+    if (req.body.mainWallet !== undefined) {
+      if (req.body.mainWallet) setSetting('main_wallet', req.body.mainWallet);
+      else db.prepare("DELETE FROM settings WHERE key = 'main_wallet'").run();
+    }
+  })();
+  res.json(gmailSettings());
+});
+
+// Logs in with the given (or saved) email + App Password and logs out again; nothing is read.
+app.post('/api/settings/gmail/test', async (req, res) => {
+  const { value, error } = readGmailBody(req.body);
+  if (error) return res.status(400).json({ error });
+  if (!gmailConfigured(value)) return res.status(400).json({ error: 'Isi email sama App Password-nya dulu' });
+  const client = gmailClient(value);
+  try {
+    await client.connect();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: e.authenticationFailed ? GMAIL_LOGIN_FAILED : `Nggak bisa nyambung ke Gmail: ${e.message}` });
+  } finally {
+    await client.logout().catch(() => {});
   }
 });
 

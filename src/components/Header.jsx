@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Eye, EyeOff, History, Mail, Monitor, Moon, RefreshCw, Sun } from 'lucide-react';
+import { Eye, EyeOff, History, Mail, Monitor, Moon, RefreshCw, Settings, Sun } from 'lucide-react';
 import CelenganAyam from './CelenganAyam';
 import { formatDate, relativeTime } from '../lib/format';
 import { useThemeMode } from '../lib/themeMode';
@@ -45,8 +45,9 @@ function useNow(ms) {
   return now;
 }
 
-export default function Header({ sync, hidden, onToggleHidden, onOpenLog, onSync, syncing }) {
+export default function Header({ sync, hidden, onToggleHidden, onOpenLog, onSettings, onSync, syncing }) {
   useNow(30 * 1000);
+  const connected = sync.configured !== false;
   return (
     <header className="mb-8 flex flex-wrap items-center justify-between gap-4">
       <div className="flex items-center gap-3">
@@ -59,7 +60,9 @@ export default function Header({ sync, hidden, onToggleHidden, onOpenLog, onSync
             <Mail size={12} />
             {/* The sync start date is only a detail, so it lives in the tooltip. */}
             <span title={`Email transaksi dibaca mulai ${formatDate(sync.start, false)}`}>
-              {syncing ? (
+              {!connected ? (
+                'Gmail belum dihubungin'
+              ) : syncing ? (
                 'Lagi ngecek email…'
               ) : sync.lastSync ? (
                 // Real date + time of the last check, plus a relative hint that keeps ticking (useNow above).
@@ -89,13 +92,17 @@ export default function Header({ sync, hidden, onToggleHidden, onOpenLog, onSync
         <button onClick={onOpenLog} className={outlineBtn}>
           <History size={15} /> Log
         </button>
+        <button onClick={onSettings} title="Pengaturan Gmail" aria-label="Pengaturan Gmail" className={outlineBtn}>
+          <Settings size={15} />
+          <span className="hidden sm:inline">Gmail</span>
+        </button>
         <button
           onClick={onSync}
           disabled={syncing}
           className="inline-flex items-center gap-2 rounded-lg bg-zinc-100 px-3.5 py-2 text-sm font-semibold text-zinc-900 shadow-sm transition-all hover:bg-white active:scale-[0.98] disabled:cursor-wait disabled:opacity-70"
         >
-          <RefreshCw size={15} className={syncing ? 'animate-spin' : ''} />
-          {syncing ? 'Lagi ngintip email…' : 'Cek mutasi'}
+          {connected ? <RefreshCw size={15} className={syncing ? 'animate-spin' : ''} /> : <Mail size={15} />}
+          {!connected ? 'Hubungin Gmail' : syncing ? 'Lagi ngintip email…' : 'Cek mutasi'}
         </button>
       </div>
     </header>

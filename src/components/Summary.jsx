@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ArrowDownLeft, ArrowUpRight, ChevronDown, Eye, EyeOff, ShieldCheck, ShieldAlert } from 'lucide-react';
+import { ArrowDownLeft, ArrowUpRight, CalendarDays, ChevronDown, Flame, Eye, EyeOff, ShieldCheck, ShieldAlert } from 'lucide-react';
 import { formatDate, pct, rupiah } from '../lib/format';
 import { Legend, StackedBar } from './charts';
 import { Card, IconButton } from './ui';
@@ -9,7 +9,40 @@ const monthLabel = (ym) =>
 
 // Hero card: net worth + allocation bar on the left; this month's *real* flow (from the ledger) on the right,
 // with the salary plan shown only as a reference line.
-export default function Summary({ stats, actual, planStart, walletCount, safe, hidden, onToggleHidden, onRecap }) {
+// The cheer that goes with a recording streak of `n` days (today = something recorded today already).
+function streakText({ current: n, today }) {
+  if (!n) return 'Yuk mulai streak, catet satu transaksi hari ini.';
+  if (!today) return `Streak ${n} hari. Catet hari ini biar nggak putus!`;
+  if (n >= 100) return `${n} hari nggak putus. Ini udah level legenda.`;
+  if (n >= 30) return `Sebulan lebih konsisten nyatet. Keren parah, pertahanin!`;
+  if (n >= 14) return `Dua minggu konsisten. Kebiasaan baik udah kebentuk nih.`;
+  if (n >= 7) return `Seminggu penuh konsisten nyatet. Mantap, lanjutkan!`;
+  if (n >= 3) return `Udah ${n} hari konsisten nyatet. Gas terus!`;
+  return 'Awal yang bagus. Besok catet lagi, ya!';
+}
+
+function StreakBadge({ streak }) {
+  const lit = streak.current > 0 && streak.today;
+  return (
+    <div className="mt-4 flex items-center gap-3 rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3">
+      <span
+        className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ring-1 ring-inset ${lit ? 'bg-amber-500/15 text-amber-400 ring-amber-500/30' : 'bg-white/[0.04] text-zinc-500 ring-white/[0.08]'}`}
+      >
+        <Flame size={18} />
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="text-sm text-zinc-200">
+          <span className="font-semibold tabular-nums">{streak.current} hari</span> berturut-turut nyatet
+          {streak.best > streak.current && <span className="text-xs text-zinc-500"> · rekor {streak.best} hari</span>}
+          {streak.best > 1 && streak.best === streak.current && <span className="text-xs text-amber-400"> · rekor baru!</span>}
+        </p>
+        <p className="text-xs text-zinc-500">{streakText(streak)}</p>
+      </div>
+    </div>
+  );
+}
+
+export default function Summary({ stats, actual, planStart, walletCount, safe, streak, hidden, onToggleHidden, onRecap, onPayday }) {
   const { totalWallets, allocation, netSavings: planNet } = stats;
   const { income, expense, net, month, count } = actual;
   const planActive = actual.month >= planStart.slice(0, 7);
@@ -26,6 +59,7 @@ export default function Summary({ stats, actual, planStart, walletCount, safe, h
         <p className="mt-1 text-4xl font-semibold tracking-tight tabular-nums sm:text-5xl">{rupiah(totalWallets)}</p>
         <p className="mt-2 text-sm text-zinc-500">Ada di {walletCount} wallet</p>
         <SafeToSpend safe={safe} />
+        {streak && <StreakBadge streak={streak} />}
         <div className="mt-6">
           <StackedBar segments={allocation} label="Alokasi saldo per wallet" />
         </div>
@@ -58,9 +92,23 @@ export default function Summary({ stats, actual, planStart, walletCount, safe, h
               </>
             )}
           </p>
+          {actual.start && (
+            <p className="mt-1 text-xs text-zinc-500">
+              Periode {shortDate(actual.start)} – {shortDate(actual.end)}
+            </p>
+          )}
+          {onPayday && (
+            <button
+              onClick={onPayday}
+              title="Gajinya maju / mundur? Atur di sini"
+              className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-sky-500/10 px-2.5 py-1.5 text-xs font-medium text-sky-300 ring-1 ring-sky-500/30 ring-inset transition-colors hover:bg-sky-500/20"
+            >
+              <CalendarDays size={13} /> Gajian {shortDate(actual.start)} · ubah
+            </button>
+          )}
           <button
             onClick={onRecap}
-            className="mt-3 text-xs font-medium text-sky-400 transition-colors hover:text-sky-300 hover:underline"
+            className="mt-3 block text-xs font-medium text-sky-400 transition-colors hover:text-sky-300 hover:underline"
           >
             Lihat rekap bulanan
           </button>

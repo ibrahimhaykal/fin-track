@@ -8,7 +8,7 @@ Data duit kalian disimpen di device sendiri, pake database SQLite. Database ngga
 
 Dashboard jalan lewat server lokal di device kalian, tanpa server pusat buat nyimpen data keuangan. Buat nyatet manual, nggak perlu internet.
 
-Kalo pake sync Gmail atau harga aset, apps bakal hubungin Gmail, CoinGecko, Indodax, atau Pasardana sesuai fitur yang dipake. Email diproses di device kalian. Request harga aset nggak ngirim saldo atau jumlah aset yang kalian punya. Konfigurasi Gmail ada di `.env` lokal, jadi file itu sama backup database simpen buat sendiri aja.
+Kalo pake sync Gmail atau harga aset, apps bakal hubungin Gmail, CoinGecko, Indodax, atau Pasardana sesuai fitur yang dipake. Email diproses di device kalian. Request harga aset nggak ngirim saldo atau jumlah aset yang kalian punya. Login Gmail (App Password) disimpen di database lokal, jadi database sama backup-nya simpen buat sendiri aja.
 
 ## Bisa ngapain aja?
 
@@ -17,6 +17,7 @@ Kalo pake sync Gmail atau harga aset, apps bakal hubungin Gmail, CoinGecko, Indo
 - Liat rekap transaksi bulanan.
 - Atur rencana pemasukan, pengeluaran, sama budget per kategori.
 - Bikin jadwal transaksi rutin dan target nabung.
+- Atur tanggal gajian per bulan. Gaji maju ke tanggal 31? Bulan berikutnya mulai dari tanggal itu.
 - Baca beberapa format notif transaksi dari Gmail. Daftarnya ada di bawah.
 - Ngitung nilai crypto dan reksa dana dari harga/NAB terbaru yang berhasil diambil.
 - Ganti tema terang/gelap atau umpetin saldo.
@@ -69,17 +70,17 @@ Database sama `.env` isinya pribadi, jangan masukin repo atau file release. Fold
 
 ## Mau sync Gmail?
 
-Ini opsional. Bikin `.env` di folder data apps:
+Ini opsional.
 
-```env
-GMAIL_USER=email@gmail.com
-GMAIL_APP_PASS=app_password_gmail
-SYNC_START_DATE=2026-10-01
-```
+1. Aktifin verifikasi 2 langkah di akun Google, terus bikin [App Password](https://myaccount.google.com/apppasswords) (16 huruf).
+2. Di dashboard klik **Hubungin Gmail** (atau tombol **Gmail** di atas), isi email, App Password, sama tanggal mulai baca email.
+3. Klik **Tes koneksi**, terus **Simpan**. Abis itu tinggal klik **Cek mutasi**.
 
-Pake App Password Gmail, terus ganti `SYNC_START_DATE` sesuai tanggal mulai catetan kalian. Restart apps setelah ngubah konfigurasi, lalu pake tombol sync Gmail di dashboard. Cek hasilnya lewat log, karena format email yang bisa dibaca masih terbatas.
+Di situ juga bisa milih **wallet utama**, buat transaksi yang email-nya nggak nyebut pocket/rekening. Cek hasilnya lewat log, karena format email yang bisa dibaca masih terbatas.
 
-## Email yang kebaca di v1.0.0
+Masih bisa lewat `.env` di folder data kayak versi lama (`GMAIL_USER`, `GMAIL_APP_PASS`, `SYNC_START_DATE`, `SYNC_MAIN_WALLET`). Kalo diisi juga di apps, yang di apps yang dipake.
+
+## Email yang kebaca
 
 Sync pake Gmail kalian. Belum semua bank atau semua notif transaksi bisa kebaca; sekarang yang dikenali ini:
 
@@ -88,6 +89,9 @@ Sync pake Gmail kalian. Belum semua bank atau semua notif transaksi bisa kebaca;
 | Jago | Dari `noreply@jago.com`: duit masuk, pembayaran/transfer keluar, pindah kantong, tarik tunai, refund, cashback, atau bunga yang nominal dan formatnya dikenali |
 | BCA | **Internet Transaction Journal / Jurnal Transaksi** myBCA buat pembayaran dan transfer keluar. Transfer ke rekening sendiri bisa dikenali kalo nama pemilik dan penerimanya cocok. Notif uang masuk BCA secara umum belum didukung |
 | Pintu | Deposit dan penarikan Rupiah dari `support@pintu.co.id`. Dicatet sebagai pindah dana antar dompet, bukan beli/jual crypto |
+| Bibit | Dari `no-reply@bibit.id`: **Pembayaran berhasil** (pindah dana ke dompet reksa dana), **Unit Reksa Dana Sudah Masuk** (jumlah unit dikoreksi sesuai email), **Dana Berhasil Dicairkan** (pindah dana balik ke bank). Perlu dompet reksa dana bertipe "Bibit" atau yang nyambung ke harga live reksa dana |
+| Mandiri (Livin') | Dari `noreply.livin@bankmandiri.co.id`: pembayaran QR, transfer, transfer BI Fast, top-up e-wallet, top-up e-money. Yang **Tidak Berhasil** dilewatin. Udah dites pake email asli |
+| Bank & e-wallet lain | BRI, BNI, BSI, CIMB Niaga, Permata, Danamon, BTN, SeaBank, OCBC, Jenius, blu, Superbank, Allo Bank, DANA, OVO, ShopeePay, LinkAja lewat **parser umum** (lihat di bawah). Belum dites pake email asli |
 | GoPay | Pola **Riwayat Tagihan GoPay / Tagihan GoPay**, dicatet sebagai pengeluaran |
 | Steam | Email pembelian/pembayaran dengan pola Steam yang dikenali dan nominal Rupiah |
 | Itemku | Email pembelian dengan pola Itemku yang dikenali dan nominal Rupiah |
@@ -95,13 +99,25 @@ Sync pake Gmail kalian. Belum semua bank atau semua notif transaksi bisa kebaca;
 Batasannya sekarang:
 
 - Cek **Inbox sama Spam**, maksimal **50 email terbaru per folder yang cocok sama filter pencarian**. Folder lain dan kandidat yang lebih lama belum diproses.
-- Mulai dari `SYNC_START_DATE`. Kalo nggak diisi, default-nya `2026-10-01`.
+- Mulai dari tanggal **Baca email mulai** di Pengaturan Gmail. Kalo nggak diisi, default-nya tanggal 1 bulan ini.
 - Parser umum nyari nominal `Rp` atau `IDR`, minimal Rp1.000. Belum konversi mata uang asing otomatis.
 - Promo/newsletter dan format yang nggak dikenali dilewatin. Notif transaksi juga bisa kelewat kalo ada kata atau header yang kebaca sebagai newsletter.
 - Email yang udah dicatet nggak diproses ulang. Ada pengecekan salinan forward sama penggabungan beberapa pasangan email transfer, tapi tetep cek hasilnya di log.
 - Dompet dicocokin dari nama/tipe. Transfer yang belum nyambung ke dompet perlu kalian hubungin dulu sebelum saldonya dipindah.
 
-Dukungan lintas bank yang lebih luas sama daftar buat ngecek format baru belum ada di versi ini. Itu buat next update.
+### Parser umum buat bank lain
+
+Email dari domain resmi bank/e-wallet di tabel atas dibaca pake pola yang umum dipake bank Indonesia, yaitu deretan "Label nilai":
+
+- **Arah**: pembayaran, transfer, top-up, tarik tunai = keluar. Dana masuk, diterima, refund, cashback = masuk.
+- **Nominal**: `Total Transaksi` / `Total Pembayaran` dulu (udah termasuk biaya), baru `Nominal` / `Jumlah`.
+- **Keterangan**: dari `Penerima`, `Merchant`, `Pengirim`, dll. Transfer ke rekening atas nama sendiri dicatet sebagai pindah dana.
+- **Wallet**: dicocokin ke dompet yang namanya/tipenya ada nama bank itu (misal dompet "Mandiri"). Kalo belum ada, transaksinya dicatet tanpa dompet.
+- Notif gagal, kode OTP, e-statement, sama notif akun dilewatin. Kalo jenis atau nominalnya nggak jelas, emailnya dilewatin dan alasannya keliatan di log, bukan ditebak.
+
+### Email bank kalian nggak kebaca?
+
+Forward satu contoh emailnya ke **ibrahimhaykal@gmail.com**. Sensor dulu nomor rekening, saldo, sama data pribadi lain. Nanti formatnya ditambahin di update berikutnya. Saran lain juga boleh, lihat [Saran, bug, atau mau request fitur?](#saran-bug-atau-mau-request-fitur).
 
 ## Buat yang mau jalanin source
 
@@ -142,3 +158,7 @@ File utamanya:
 - `electron/`: jendela desktop, tray, sama ikon.
 
 Commit source sama `package-lock.json`. Dependency, hasil build, database, backup, dan konfigurasi pribadi udah dikecualikan lewat `.gitignore`.
+
+## Saran, bug, atau mau request fitur?
+
+Hubungin gue aja di **ibrahimhaykal@gmail.com**, atau buka [issue di GitHub](https://github.com/ibrahimhaykal/celengin/issues). Semua masukan kepake, dari ide fitur, bug, sampe bank yang belum kebaca. Jangan kirim database, password, atau screenshot yang keliatan saldo sama nomor rekening, ya.
