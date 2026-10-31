@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Eye, EyeOff, History, Mail, Monitor, Moon, RefreshCw, Settings, Sun } from 'lucide-react';
+import { Download, Eye, EyeOff, History, Mail, Monitor, Moon, RefreshCw, Settings, Sun } from 'lucide-react';
 import CelenganAyam from './CelenganAyam';
 import { formatDate, relativeTime } from '../lib/format';
 import { useThemeMode } from '../lib/themeMode';
@@ -45,7 +45,7 @@ function useNow(ms) {
   return now;
 }
 
-export default function Header({ sync, hidden, onToggleHidden, onOpenLog, onSettings, onSync, syncing }) {
+export default function Header({ sync, hidden, onToggleHidden, onOpenLog, onSettings, onSync, syncing, update }) {
   useNow(30 * 1000);
   const connected = sync.configured !== false;
   return (
@@ -92,9 +92,20 @@ export default function Header({ sync, hidden, onToggleHidden, onOpenLog, onSett
         <button onClick={onOpenLog} className={outlineBtn}>
           <History size={15} /> Log
         </button>
-        <button onClick={onSettings} title="Pengaturan Gmail" aria-label="Pengaturan Gmail" className={outlineBtn}>
+        {update?.available && (
+          <a
+            href={update.url}
+            target="_blank"
+            rel="noreferrer"
+            title={`Celengin ${update.latest} udah rilis (kamu pakai v${update.current})`}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500/10 px-3 py-2 text-sm font-medium text-emerald-300 ring-1 ring-emerald-500/30 ring-inset transition-colors hover:bg-emerald-500/20"
+          >
+            <Download size={15} /> Update {update.latest}
+          </a>
+        )}
+        <button onClick={onSettings} title="Pengaturan" aria-label="Pengaturan" className={outlineBtn}>
           <Settings size={15} />
-          <span className="hidden sm:inline">Gmail</span>
+          <span className="hidden sm:inline">Pengaturan</span>
         </button>
         <button
           onClick={onSync}

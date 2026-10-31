@@ -26,6 +26,9 @@ import {
   PaydayForm,
   GmailSettingsForm,
 } from './components/Forms';
+import LockScreen from './components/LockScreen';
+import Onboarding from './components/Onboarding';
+import SettingsModal, { useUpdateCheck } from './components/SettingsModal';
 import Header from './components/Header';
 import RecapModal, { RecapBanner, markRecapSeen, recapSeen } from './components/RecapModal';
 import MilestoneRoadmap from './components/MilestoneRoadmap';
@@ -34,10 +37,53 @@ import SyncLogModal from './components/SyncLogModal';
 import WalletGrid from './components/WalletGrid';
 
 // App owns the dashboard data and every action that changes it; components only render.
+const UNLOCKED_KEY = 'celengin-unlocked';
+const RELOCK_AFTER_MS = 5 * 60 * 1000;
+
+// PIN lock state: locked on open (once per session) and again after the window sat hidden in the tray for a while.
+function usePinLock() {
+  const [state, setState] = useState({ enabled: false, locked: false, checked: false });
+  useEffect(() => {
+    let unlocked = false;
+    try {
+      unlocked = sessionStorage.getItem(UNLOCKED_KEY) === '1';
+    } catch {
+      // storage blocked: ask every time
+    }
+    request('/lock')
+      .then((r) => setState({ enabled: r.enabled, locked: r.enabled && !unlocked, checked: true }))
+      .catch(() => setState((s) => ({ ...s, checked: true })));
+  }, []);
+  useEffect(() => {
+    let hiddenAt = 0;
+    const onVisibility = () => {
+      if (document.hidden) hiddenAt = Date.now();
+      else if (hiddenAt && Date.now() - hiddenAt > RELOCK_AFTER_MS) setState((s) => (s.enabled ? { ...s, locked: true } : s));
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+  }, []);
+  const remember = (value) => {
+    try {
+      sessionStorage.setItem(UNLOCKED_KEY, value);
+    } catch {
+      // ignore
+    }
+  };
+  return {
+    ...state,
+    unlock: () => {
+      remember('1');
+      setState((s) => ({ ...s, locked: false }));
+    },
+    setEnabled: (enabled) => setState((s) => ({ ...s, enabled })),
+  };
+}
+
 export default function App() {
   const [data, setData] = useState(null);
   const [loadError, setLoadError] = useState('');
-  const [modal, setModal] = useState(null); // 'transaction' | 'wallet' | 'expense' | 'milestone' | 'syncLog' | 'gmail'
+  const [modal, setModal] = useState(null); // 'transaction' | 'wallet' | 'expense' | 'milestone' | 'syncLog' | 'gmail' | 'settings'
   const [iconFor, setIconFor] = useState(null); // wallet whose icon is being changed
   const [cryptoFor, setCryptoFor] = useState(null); // wallet being set up as a live crypto wallet
   const [linkFor, setLinkFor] = useState(null); // unlinked transfer being matched to wallets
@@ -49,6 +95,9 @@ export default function App() {
   const [hidden, setHidden] = useState(readHiddenPref);
   const [recap, setRecap] = useState(null); // { month } while the recap modal is open (month null = last month)
   const [recapDismissed, setRecapDismissed] = useState(false);
+  const [onboarded, setOnboarded] = useState(false); // finished or skipped the first-run steps this session
+  const update = useUpdateCheck();
+  const lock = usePinLock();
   setAmountsHidden(hidden);
 
   const toggleHidden = () =>
@@ -308,7 +357,9 @@ export default function App() {
     }
   };
 
-  if (!data) {
+  // PIN first: nothing of the dashboard renders until it is entered (or the lock state is known).
+  if (lock.locked) return <LockScreen onUnlock={lock.unlock} />;
+  if (!data || !lock.checked) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-zinc-950 text-sm text-zinc-400">
         {loadError ? (
@@ -322,6 +373,16 @@ export default function App() {
         )}
       </div>
     );
+  }
+
+  // First run: no wallet yet. The steps create their rows directly; the dashboard reloads when they end.
+  if (!onboarded && data.wallets.length === 0) {
+    const finish = (then) => {
+      setOnboarded(true);
+      then?.();
+      load();
+    };
+    return <Onboarding onDone={() => finish()} onGmail={() => finish(() => setModal('gmail'))} />;
   }
 
   const { wallets, expenses, milestones, sync = {} } = data;
@@ -355,7 +416,8 @@ export default function App() {
           hidden={hidden}
           onToggleHidden={toggleHidden}
           onOpenLog={() => openSyncLog()}
-          onSettings={() => setModal('gmail')}
+          onSettings={() => setModal('settings')}
+          update={update}
           onSync={syncGmail}
           syncing={syncing}
         />
@@ -522,6 +584,23 @@ export default function App() {
         <LinkTransferForm tx={linkFor} wallets={wallets} onLink={linkTransaction} onClose={() => setLinkFor(null)} />
       )}
       {modal === 'gmail' && <GmailSettingsForm wallets={wallets} onSaved={saveGmailSettings} onClose={closeModal} />}
+      {modal === 'settings' && (
+        <SettingsModal
+          lock={lock}
+          update={update}
+          onLockChange={lock.setEnabled}
+          onGmail={() => setModal('gmail')}
+          onPayday={
+            data.actual.periods
+              ? () => {
+                  setModal(null);
+                  setPaydayOpen(true);
+                }
+              : null
+          }
+          onClose={closeModal}
+        />
+      )}
       {modal === 'syncLog' && (
         <SyncLogModal
           result={syncResult}

@@ -1,6 +1,6 @@
 // Desktop shell: runs the Express API + built dashboard in-process and shows it in a window.
 // Closing the window hides it to the tray (crypto prices keep refreshing); quit from the tray menu.
-import { app, BrowserWindow, Menu, Tray, nativeImage, nativeTheme, shell } from 'electron';
+import { app, BrowserWindow, Menu, Tray, dialog, nativeImage, nativeTheme, shell } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -34,6 +34,11 @@ async function start() {
   process.env.APP_DIST = path.join(ROOT, 'dist');
   process.env.PORT = PORT;
   process.env.HOST = '127.0.0.1';
+  // Lets the server restart the app after a restore (the restored database is swapped in on start).
+  globalThis.celenginRestart = () => {
+    app.relaunch({ args: process.argv.slice(1).filter((a) => a !== '--hidden') });
+    app.exit(0);
+  };
   await import('../server.js');
   await waitForServer();
 
@@ -133,6 +138,24 @@ function createTray() {
           click: (item) => {
             app.setLoginItemSettings({ openAtLogin: item.checked, path: process.execPath, args: loginArgs() });
             rebuild();
+          },
+        },
+        {
+          label: 'Lupa PIN? Reset PIN',
+          click: async () => {
+            const { response } = await dialog.showMessageBox({
+              type: 'warning',
+              buttons: ['Batal', 'Reset PIN'],
+              defaultId: 0,
+              cancelId: 0,
+              title: 'Reset PIN',
+              message: 'Hapus PIN Celengin?',
+              detail: 'Celengin bakal kebuka tanpa PIN. Data kamu nggak kehapus.',
+            });
+            if (response !== 1) return;
+            globalThis.celenginResetPin?.();
+            showWindow();
+            win?.webContents.reload();
           },
         },
         { type: 'separator' },

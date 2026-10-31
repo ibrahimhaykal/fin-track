@@ -21,7 +21,10 @@ Kalo pake sync Gmail atau harga aset, apps bakal hubungin Gmail, CoinGecko, Indo
 - Baca beberapa format notif transaksi dari Gmail. Daftarnya ada di bawah.
 - Ngitung nilai crypto dan reksa dana dari harga/NAB terbaru yang berhasil diambil.
 - Ganti tema terang/gelap atau umpetin saldo.
-- Backup database otomatis tiap hari, nyimpen 14 backup terbaru.
+- Backup database otomatis tiap hari (nyimpen 14 terakhir), plus download backup, restore, sama export transaksi ke CSV dari menu **Pengaturan**.
+- Kunci pakai PIN pas apps dibuka.
+- Streak nyatet harian biar tetep semangat.
+- Dikasih tau kalo ada versi baru.
 
 ## Aset apa aja?
 
@@ -41,9 +44,9 @@ Kalo internet atau sumber harga gagal, saldo pake nilai terakhir yang berhasil d
 
 ## Install di Windows
 
-Download `Celengin-Setup-1.0.0-x64.exe` dari [Releases](https://github.com/ibrahimhaykal/celengin/releases), jalanin installer, terus buka dari shortcut. Nggak perlu install Node.js buat versi ini.
+Download `Celengin-Setup-<versi>-x64.exe` versi terbaru dari [Releases](https://github.com/ibrahimhaykal/celengin/releases), jalanin installer, terus buka dari shortcut. Nggak perlu install Node.js buat versi ini.
 
-Pas pertama dibuka, datanya kosong. Isi pake data kalian sendiri.
+Pas pertama dibuka, ada 3 langkah singkat: bikin wallet pertama, pilih budget bulanan dari template, terus (opsional) hubungin Gmail.
 
 ## Mulai pakenya gimana?
 
@@ -149,7 +152,7 @@ npm ci
 npm run release:win
 ```
 
-Hasilnya di `release/Celengin-Setup-1.0.0-x64.exe`. Database, backup, sama `.env` nggak ikut di installer.
+Hasilnya di `release/Celengin-Setup-<versi>-x64.exe`. Database, backup, sama `.env` nggak ikut di installer.
 
 File utamanya:
 

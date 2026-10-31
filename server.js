@@ -1,5 +1,7 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
 import Database from 'better-sqlite3';
@@ -8,7 +10,16 @@ import { ImapFlow } from 'imapflow';
 const PORT = Number(process.env.PORT) || 5000;
 // Loopback only: the API exposes balances and must not be reachable from other devices on the network.
 const HOST = process.env.HOST || '127.0.0.1';
-const db = new Database(process.env.FINANCE_DB || 'finance.db');
+const DB_FILE = path.resolve(process.env.FINANCE_DB || 'finance.db');
+// A restore uploaded from the app is swapped in here, before the database is opened; the replaced one is kept.
+const RESTORE_FILE = `${DB_FILE}.restore`;
+if (fs.existsSync(RESTORE_FILE)) {
+  const kept = `${DB_FILE.replace(/\.db$/, '')}.before-restore-${Date.now()}.db`;
+  // The -wal / -shm files move along, so the kept copy still has its latest writes.
+  for (const side of ['', '-wal', '-shm']) if (fs.existsSync(DB_FILE + side)) fs.renameSync(DB_FILE + side, kept + side);
+  fs.renameSync(RESTORE_FILE, DB_FILE);
+}
+const db = new Database(DB_FILE);
 db.pragma('journal_mode = WAL');
 
 // ---------- Schema ----------
@@ -2617,6 +2628,136 @@ app.put('/api/wallets/:id/crypto', async (req, res) => {
        price_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
   ).run(asset, amount, Math.round(amount * p.price), p.price, p.change, p.at || new Date().toISOString(), id);
   res.json(db.prepare('SELECT * FROM wallets WHERE id = ?').get(id));
+});
+
+// ---------- Export, backup & restore ----------
+const csvCell = (v) => {
+  const s = v == null ? '' : String(v);
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+const TX_TYPE_LABEL = { income: 'Pemasukan', expense: 'Pengeluaran', transfer: 'Transfer' };
+
+// Every ledger row as CSV (UTF-8 with BOM so Excel shows "·" and accents right). Amounts are plain numbers.
+app.get('/api/export/transactions.csv', (req, res) => {
+  const names = Object.fromEntries(db.prepare('SELECT id, name FROM wallets').all().map((w) => [w.id, w.name]));
+  const rows = db.prepare('SELECT * FROM transactions ORDER BY date, id').all();
+  const lines = [
+    ['Tanggal', 'Jenis', 'Nominal', 'Keterangan', 'Kategori', 'Wallet', 'Ke wallet', 'Sumber'],
+    ...rows.map((r) => [
+      r.date,
+      TX_TYPE_LABEL[r.type] || r.type,
+      r.amount,
+      r.description,
+      r.category,
+      names[r.wallet] || r.from_pocket || r.wallet,
+      r.type === 'transfer' ? names[r.to_wallet] || r.to_pocket || r.to_wallet : '',
+      r.source,
+    ]),
+  ];
+  res
+    .set('Content-Type', 'text/csv; charset=utf-8')
+    .attachment(`celengin-transaksi-${wibDate()}.csv`)
+    .send(`﻿${lines.map((l) => l.map(csvCell).join(',')).join('\r\n')}\r\n`);
+});
+
+// A consistent copy of the whole database (wallets, ledger, settings…) to keep or move to another device.
+app.get('/api/backup/download', (req, res) => {
+  const file = path.join(os.tmpdir(), `celengin-backup-${process.pid}-${Date.now()}.db`);
+  db.exec(`VACUUM INTO '${file.replace(/'/g, "''")}'`);
+  res.download(file, `celengin-backup-${wibDate()}.db`, () => fs.rm(file, { force: true }, () => {}));
+});
+
+// Restore from a backup file (raw body). Checked to be a Celengin database, then swapped in on the next start;
+// the desktop app restarts itself (main.js sets globalThis.celenginRestart), the dev server needs a manual restart.
+app.post('/api/backup/restore', express.raw({ type: '*/*', limit: '512mb' }), (req, res) => {
+  const buf = req.body;
+  if (!Buffer.isBuffer(buf) || buf.subarray(0, 16).toString('latin1') !== 'SQLite format 3\u0000') {
+    return res.status(400).json({ error: 'Itu bukan file backup Celengin (.db)' });
+  }
+  const tmp = `${RESTORE_FILE}.check`;
+  fs.writeFileSync(tmp, buf);
+  try {
+    const check = new Database(tmp, { readonly: true, fileMustExist: true });
+    const tables = new Set(check.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((t) => t.name));
+    check.close();
+    if (!['wallets', 'transactions'].every((t) => tables.has(t))) throw new Error('missing tables');
+  } catch {
+    fs.rmSync(tmp, { force: true });
+    return res.status(400).json({ error: 'File-nya rusak atau bukan backup Celengin' });
+  }
+  fs.renameSync(tmp, RESTORE_FILE);
+  const restart = typeof globalThis.celenginRestart === 'function';
+  res.json({ restart });
+  if (restart) setTimeout(() => globalThis.celenginRestart(), 500);
+});
+
+// ---------- PIN lock ----------
+// A screen lock for the dashboard (the app sits in the tray all day). It hides the UI from someone at this
+// computer; it does not encrypt the database. Stored as "salt:scrypt hash".
+const PIN_RE = /^\d{4,6}$/;
+const hashPin = (pin, salt = crypto.randomBytes(16).toString('hex')) =>
+  `${salt}:${crypto.scryptSync(pin, salt, 32).toString('hex')}`;
+function pinMatches(pin) {
+  const stored = getSetting('pin_hash', null);
+  if (!stored) return true;
+  const [salt, hash] = stored.split(':');
+  const given = crypto.scryptSync(String(pin || ''), salt, 32);
+  return crypto.timingSafeEqual(given, Buffer.from(hash, 'hex'));
+}
+
+app.get('/api/lock', (req, res) => res.json({ enabled: Boolean(getSetting('pin_hash', null)) }));
+// Forgotten PIN: the desktop tray offers a reset (whoever can reach the tray can also open the database file).
+globalThis.celenginResetPin = () => db.prepare("DELETE FROM settings WHERE key = 'pin_hash'").run().changes > 0;
+
+app.post('/api/lock/verify', async (req, res) => {
+  if (pinMatches(req.body.pin)) return res.json({ ok: true });
+  await new Promise((r) => setTimeout(r, 600)); // slows down guessing
+  res.status(401).json({ error: 'PIN-nya salah' });
+});
+
+// { pin, current }: set or change the PIN (current one required once set). { pin: null, current } turns it off.
+app.put('/api/lock', (req, res) => {
+  if (getSetting('pin_hash', null) && !pinMatches(req.body.current)) return res.status(401).json({ error: 'PIN lama salah' });
+  if (req.body.pin == null) {
+    db.prepare("DELETE FROM settings WHERE key = 'pin_hash'").run();
+    return res.json({ enabled: false });
+  }
+  const pin = String(req.body.pin);
+  if (!PIN_RE.test(pin)) return res.status(400).json({ error: 'PIN-nya 4 sampai 6 angka' });
+  setSetting('pin_hash', hashPin(pin));
+  res.json({ enabled: true });
+});
+
+// ---------- Update check ----------
+// No auto-installer (keeps the app small): the latest GitHub release is compared with this version and the UI
+// links to its download. Cached for 6 hours; failures (offline, rate limit) just report nothing new.
+const APP_VERSION = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
+const RELEASES_API = 'https://api.github.com/repos/ibrahimhaykal/celengin/releases/latest';
+const newerVersion = (a, b) => {
+  const [x, y] = [a, b].map((v) => String(v).replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0));
+  for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0);
+  return false;
+};
+let updateCache = { at: 0, value: null };
+app.get('/api/update', async (req, res) => {
+  if (Date.now() - updateCache.at > 6 * 3600e3) {
+    try {
+      const r = await fetchJson(RELEASES_API);
+      const exe = (r.assets || []).find((a) => /\.exe$/i.test(a.name));
+      updateCache = {
+        at: Date.now(),
+        value: { latest: r.tag_name, url: exe?.browser_download_url || r.html_url, notes: r.html_url },
+      };
+    } catch {
+      updateCache = { at: Date.now() - 5 * 3600e3, value: null }; // retry in an hour
+    }
+  }
+  const latest = updateCache.value;
+  res.json({
+    current: APP_VERSION,
+    available: Boolean(latest && newerVersion(latest.latest, APP_VERSION)),
+    ...(latest || {}),
+  });
 });
 
 // Built dashboard (npm run build), served from the same origin as the API. Used by the desktop app;
