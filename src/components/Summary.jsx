@@ -18,7 +18,7 @@ function streakText({ current: n, today }) {
   if (n >= 14) return `Dua minggu konsisten. Kebiasaan baik udah kebentuk nih.`;
   if (n >= 7) return `Seminggu penuh konsisten nyatet. Mantap, lanjutkan!`;
   if (n >= 3) return `Udah ${n} hari konsisten nyatet. Gas terus!`;
-  return 'Awal yang bagus. Besok catet lagi, ya!';
+  return 'Fokus, besok masukin ke celenganmu lagi yaa!';
 }
 
 function StreakBadge({ streak }) {
